@@ -99,7 +99,8 @@ python train.py \
 - 交互层：Cross-Attention(蛋白↔配体, 蛋白↔辅因子) → 融合特征
 - 预测头：pKd (底物亲和力排序) + kcat (蛋白级催化效率，辅助任务)
 - λ 预测头保留但不再参与主损失计算
-- 损失：`L = L_pkd(带 thermo_weight) + L_kcat(带 source_weight)` — 无 Marcus 物理约束，无 OT 正则化
+- **Hybrid 架构**：kcat 由独立的 KcatPredictor (ESM-2 + cofactor → MLP) 预测，不经过蛋白-配体交互模块，避免底物级/蛋白级表征冲突（消除负迁移）
+- 损失：`L = L_score(both_mask) + L_pkd_fallback(pkd_only)`，其中 `L_score = SmoothL1(pkd_pred + log_kcat_pred - pkd_true - log_kcat_true)`，直接优化 kcat/KM 排序；无 kcat 标签的样本退化为纯 pKd 损失
 - thermo_weight: Kd=1.0, Ki=0.7, IC50=0.15（反映不同测量类型对热力学平衡常数的可信度）
 - pkd_head: sigmoid 约束到 [2, 15]；λ 预测头保留但不参与损失
 
@@ -110,7 +111,7 @@ python train.py \
 - 总记录：78,113（PDBbind 216 + BindingDB 77,898）
 - 唯一蛋白序列：541（全 TrEMBL，无 Swiss-Prot reviewed）
 - 唯一配体 (InChIKey)：57,203
-- Split：train 55,388 (70.9%) / val 9,951 (12.7%) / test 12,775 (16.4%)，蛋白级哈希分割
+- Split：train 62,491 (80.0%) / val 7,812 (10.0%) / test 7,810 (10.0%)，蛋白级分层分割（kcat 覆盖 + record 数平衡，2026-05-27 更新）
 
 ### 结合亲和力 (pKd)
 
@@ -161,7 +162,7 @@ kcat 异常值: 378 条 (0.5%)，标记为 kcat_outlier=True
 3. **去掉 Marcus 物理约束**：诊断证实 kcat_true / kcat_marcus ≈ 10⁻⁶（100% 蛋白），L_physics 产生系统性错误梯度，已移除
 4. **pKd 排序替代 kcat 回归**：kcat 无底物级变化，pKd 有——当前用 pKd 作为底物偏好排序信号
 5. **热力学分层权重**：thermo_weight = Kd(1.0) / Ki(0.7) / IC50(0.15)，乘入 quality_weight（已在 train.py 实现）
-6. **蛋白级 split**：按蛋白序列哈希分层，辅因子类型覆盖验证
+6. **蛋白级 split + kcat 分层**：按蛋白序列哈希分层，辅因子类型覆盖验证；2026-05-27 增加 kcat 覆盖率分层 + record 数平衡，确保所有 split 的 kcat 覆盖率一致（78.7%）
 7. **kcat 异常值标记**：378 条记录标记为异常（kcat > 1e3 或 < 1e-3）
 8. **结构特征全覆盖**：541/541 (100%) 蛋白有结构特征（contact_number + protrusion_index），包括 5 个新补充的蛋白
 9. **口袋几何特征已实现**：PocketEncoder (Gaussian-kernel 距离加权消息传递) 已集成，541/541 (100%) 蛋白有口袋特征

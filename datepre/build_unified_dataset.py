@@ -305,72 +305,126 @@ def make_splits(df: pd.DataFrame,
                 test_frac: float = 0.1,
                 seed: int = 42,
                 ) -> pd.DataFrame:
-    """按 protein_seq_hash 哈希划分 train/val/test，确保主辅因子类型覆盖。"""
-    log.info(f"Re-splitting dataset: {train_frac:.0%}/{val_frac:.0%}/{test_frac:.0%}")
+    """按 protein_seq_hash 哈希划分 train/val/test，确保辅因子类型和 kcat 覆盖分层。
+
+    分层策略：
+      1. 蛋白按是否有 kcat 数据分为两层
+      2. 每层内独立哈希分割 → 各 split 的 kcat 覆盖率保持一致
+      3. 辅因子类型覆盖检查 + 修复
+    """
+    log.info(f"Re-splitting dataset: {train_frac:.0%}/{val_frac:.0%}/{test_frac:.0%} "
+             f"(stratified by kcat availability)")
 
     unique_hashes = df["protein_seq_hash"].unique()
     n_proteins = len(unique_hashes)
     log.info(f"  Unique proteins: {n_proteins}")
 
+    # ── 分层：按蛋白是否有 kcat 数据 ──
+    protein_has_kcat = df.groupby("protein_seq_hash")["has_kcat"].any()
+    hashes_with_kcat = sorted(protein_has_kcat[protein_has_kcat].index)
+    hashes_without_kcat = sorted(protein_has_kcat[~protein_has_kcat].index)
+    log.info(f"  With kcat: {len(hashes_with_kcat)}, "
+             f"Without kcat: {len(hashes_without_kcat)}")
+
     rng = np.random.RandomState(seed)
-    hash_indices = np.array([
-        int(hashlib.md5(f"{h}_{seed}".encode()).hexdigest(), 16) % 100000
-        for h in unique_hashes
-    ])
-    perm = rng.permutation(n_proteins)
-    sorted_indices = np.argsort(hash_indices[perm])
+    train_hashes: set[str] = set()
+    val_hashes: set[str] = set()
+    test_hashes: set[str] = set()
 
-    n_train = int(n_proteins * train_frac)
-    n_val = int(n_proteins * val_frac)
+    # ── 预处理：每个蛋白的辅因子类型和 record 数 ──
+    def _primary_cf(row):
+        cf = str(row.get("cofactors", "") or "")
+        return cf.split("|")[0].strip() if cf else "none"
 
-    train_hashes = set(unique_hashes[perm[sorted_indices[:n_train]]])
-    val_hashes = set(unique_hashes[perm[sorted_indices[n_train:n_train + n_val]]])
-    test_hashes = set(unique_hashes[perm[sorted_indices[n_train + n_val:]]])
+    protein_cf_map = {}
+    protein_n_records = {}
+    for h in unique_hashes:
+        sub = df[df["protein_seq_hash"] == h]
+        protein_n_records[h] = len(sub)
+        protein_cf_map[h] = _primary_cf(sub.iloc[0])
 
-    # 验证主辅因子类型覆盖
-    if "cofactors" in df.columns:
-        def _primary_cofactor(cf_str: str) -> str:
-            if not cf_str or pd.isna(cf_str):
-                return "none"
-            return str(cf_str).split("|")[0].strip()
+    # ── kcat 分层内全局 LPT：主目标 = record 平衡 (80/10/10) ──
+    # 辅因子分布无法与 record+kcat 同时完美平衡（单个蛋白可占一种辅因子 90%+ 的 records）
+    # 辅因子通过后续 fixup 保证覆盖，不在此处做硬约束
+    for stratum_name, stratum_hashes in [
+        ("kcat+", hashes_with_kcat),
+        ("kcat-", hashes_without_kcat),
+    ]:
+        n = len(stratum_hashes)
+        if n == 0:
+            continue
 
-        df_temp = df.copy()
-        df_temp["_primary_cf"] = df_temp["cofactors"].apply(_primary_cofactor)
+        stratum_records = sum(protein_n_records[h] for h in stratum_hashes)
+        target_r_train = stratum_records * train_frac
+        target_r_val = stratum_records * val_frac
+        target_r_test = stratum_records * test_frac
 
-        # 每个蛋白质的主要辅因子（按记录数最多的主类型）
-        protein_cf = df_temp.groupby("protein_seq_hash")["_primary_cf"].agg(
-            lambda x: x.value_counts().index[0]
-        )
+        s_train, s_val, s_test = set(), set(), set()
+        r_train, r_val, r_test = 0, 0, 0
 
-        def _check_coverage(split_hashes, split_name):
-            cf_types = set(protein_cf[list(split_hashes)])
-            all_types = set(protein_cf.values)
-            missing = all_types - cf_types
-            if missing:
-                log.warning(f"  {split_name} missing cofactor types: {missing}")
+        # 按 record 降序排列（LPT：大蛋白优先分配）
+        shuffled = list(stratum_hashes)
+        rng.shuffle(shuffled)
+        sorted_hashes = sorted(shuffled, key=lambda h: protein_n_records[h], reverse=True)
 
-        _check_coverage(train_hashes, "train")
-        _check_coverage(val_hashes, "val")
-        _check_coverage(test_hashes, "test")
+        for h in sorted_hashes:
+            n_rec = protein_n_records[h]
+            deficit_train = target_r_train - r_train
+            deficit_val = target_r_val - r_val
+            deficit_test = target_r_test - r_test
 
-        # 修复：将缺失辅因子类型的蛋白从 train 移到 val/test
-        for target_set, target_name in [(val_hashes, "val"), (test_hashes, "test")]:
-            target_cf = set(protein_cf[list(target_set)])
-            all_cf = set(protein_cf.values)
-            missing_cf = all_cf - target_cf
-            if missing_cf:
-                for cf_type in missing_cf:
-                    # 找一个有该辅因子的 train 蛋白移到目标集
-                    candidates = [
-                        h for h in train_hashes
-                        if protein_cf.get(h) == cf_type
-                    ]
-                    if candidates:
-                        h_move = candidates[0]
-                        train_hashes.discard(h_move)
-                        target_set.add(h_move)
-                log.info(f"  Moved {sum(1 for cf in missing_cf for _ in [1])} "
-                         f"proteins to {target_name} for cofactor coverage")
+            candidates = [
+                ("train", deficit_train),
+                ("val", deficit_val),
+                ("test", deficit_test),
+            ]
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            pick = candidates[0][0]
+
+            if pick == "train":
+                s_train.add(h); r_train += n_rec
+            elif pick == "val":
+                s_val.add(h); r_val += n_rec
+            else:
+                s_test.add(h); r_test += n_rec
+
+        train_hashes.update(s_train)
+        val_hashes.update(s_val)
+        test_hashes.update(s_test)
+
+        log.info(f"  {stratum_name} ({n} proteins, {stratum_records} records): "
+                 f"train={len(s_train)}p/{r_train}r ({r_train/stratum_records*100:.0f}%), "
+                 f"val={len(s_val)}p/{r_val}r ({r_val/stratum_records*100:.0f}%), "
+                 f"test={len(s_test)}p/{r_test}r ({r_test/stratum_records*100:.0f}%)")
+
+    # 验证分层后各 split 的 kcat 覆盖率
+    for name, hashes in [("train", train_hashes), ("val", val_hashes), ("test", test_hashes)]:
+        n_kcat = sum(1 for h in hashes if h in hashes_with_kcat)
+        n_total = len(hashes)
+        log.info(f"  {name} kcat coverage: {n_kcat}/{n_total} proteins ({n_kcat/n_total*100:.0f}%)")
+
+    # ── 辅因子类型覆盖检查 + 修复 ──
+    all_cf = set(protein_cf_map.values())
+    for split_hashes, split_name in [(train_hashes, "train"), (val_hashes, "val"), (test_hashes, "test")]:
+        split_cf = set(protein_cf_map[h] for h in split_hashes)
+        missing = all_cf - split_cf
+        if missing:
+            log.warning(f"  {split_name} missing cofactor types: {missing}")
+
+    # 修复：确保所有 split 都有每种辅因子类型
+    for target_set, target_name in [(val_hashes, "val"), (test_hashes, "test"), (train_hashes, "train")]:
+        target_cf = set(protein_cf_map[h] for h in target_set)
+        missing_cf = all_cf - target_cf
+        if missing_cf:
+            donor_pool = (train_hashes | val_hashes | test_hashes) - target_set
+            for cf_type in missing_cf:
+                candidates = [h for h in donor_pool if protein_cf_map.get(h) == cf_type]
+                if candidates:
+                    h_move = candidates[0]
+                    for pool_set in [train_hashes, val_hashes, test_hashes]:
+                        pool_set.discard(h_move)
+                    target_set.add(h_move)
+            log.info(f"  Moved proteins to {target_name} for cofactor coverage: {missing_cf}")
 
     def _assign(h):
         if h in train_hashes:
@@ -382,13 +436,13 @@ def make_splits(df: pd.DataFrame,
 
     df["split"] = df["protein_seq_hash"].apply(_assign)
 
-    # 验证
+    # ── 验证 ──
     counts = df["split"].value_counts()
     for s in ["train", "val", "test"]:
         pct = counts.get(s, 0) / len(df) * 100
-        log.info(f"    {s}: {counts.get(s, 0):,} ({pct:.1f}%)")
+        log.info(f"    {s}: {counts.get(s, 0):,} records ({pct:.1f}%)")
 
-    # 验证无蛋白泄露
+    # 蛋白隔离检查
     train_proteins = set(df[df["split"] == "train"]["protein_seq_hash"])
     val_proteins = set(df[df["split"] == "val"]["protein_seq_hash"])
     test_proteins = set(df[df["split"] == "test"]["protein_seq_hash"])
@@ -411,6 +465,14 @@ def make_splits(df: pd.DataFrame,
                 "|").str[0].value_counts().head(5)
             cf_str = ", ".join(f"{k}:{v}" for k, v in cf_counts.items())
             log.info(f"    {split_val}: {cf_str}")
+
+    # kcat 覆盖率最终报告
+    log.info("  kcat record coverage by split:")
+    for split_val in ["train", "val", "test"]:
+        sub = df[df["split"] == split_val]
+        n_kcat = int(sub["has_kcat"].sum())
+        n_total = len(sub)
+        log.info(f"    {split_val}: {n_kcat}/{n_total} records ({n_kcat/n_total*100:.1f}%)")
 
     return df
 
