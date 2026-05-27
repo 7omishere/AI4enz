@@ -495,7 +495,10 @@ class InteractionModule(nn.Module):
 # ─────────────────────────────────────────────────────────────
 
 class MultiTaskHead(nn.Module):
-    """三头预测器：pKd, λ, kcat"""
+    """双头预测器：pKd, λ（从蛋白-配体交互特征中预测）。
+
+    kcat 不再从此头预测——由独立的 KcatPredictor 从蛋白序列+辅因子特征直接预测。
+    """
 
     def __init__(self, hidden_dim: int = 256):
         super().__init__()
@@ -522,24 +525,56 @@ class MultiTaskHead(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # kcat 预测头：输出 log10(kcat) 避免大范围数值
-        self.kcat_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.SiLU(),
-            nn.Linear(64, 1),
-        )
-
     def forward(self, x: torch.Tensor):
         h = self.shared(x)
         pkd = self.pkd_head(h).squeeze(-1)           # (B,)
         pkd = 2.0 + 13.0 * torch.sigmoid(pkd)        # constrain to [2, 15]
         lambda_offset = self.lambda_head(h).squeeze(-1)  # (B,)  Δλ in eV
-        log_kcat = self.kcat_head(h).squeeze(-1)     # (B,)  log10(kcat)
-        return pkd, lambda_offset, log_kcat
+        return pkd, lambda_offset
 
 
 # ─────────────────────────────────────────────────────────────
-# 物理损失函数
+# kcat 预测器（蛋白级，独立路径）
+# ─────────────────────────────────────────────────────────────
+
+class KcatPredictor(nn.Module):
+    """蛋白级 kcat 预测器：从蛋白序列 + 辅因子特征直接预测催化速率。
+
+    设计原则：
+      - kcat 是蛋白级属性（同一蛋白所有底物共享），不需要配体信息
+      - 与 pKd 的交互路径分离，避免底物级和蛋白级表征冲突（消除负迁移）
+      - 基线验证：纯 ESM-2 → MLP 的 kcat R²=0.721，本模块复用此结论
+
+    输入：
+      - seq_embed: (B, 1280) ESM-2 或 (B, 6) AA 物化性质
+      - cofactor_embed: (B, cofactor_dim) 辅因子类型嵌入
+    """
+
+    def __init__(self, seq_embed_dim: int = 1280, cofactor_dim: int = 64,
+                 hidden_dim: int = 256):
+        super().__init__()
+        input_dim = seq_embed_dim + cofactor_dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, seq_embed: torch.Tensor, cofactor_embed: torch.Tensor) -> torch.Tensor:
+        """Returns log10(kcat) (B,)"""
+        x = torch.cat([seq_embed, cofactor_embed], dim=-1)
+        return self.mlp(x).squeeze(-1)
+
+
+# ─────────────────────────────────────────────────────────────
+# 物理损失函数（保留但不参与训练，Marcus 方程经验证不适用于当前数据集）
 # ─────────────────────────────────────────────────────────────
 
 class MarcusPhysicsLoss(nn.Module):
@@ -799,11 +834,16 @@ class OTRegularizer(nn.Module):
 
 class MarcusPINN(nn.Module):
     """
-    酶挖掘排序模型：预测酶-底物结合亲和力 (pKd) 用于底物偏好排序。
+    酶挖掘排序模型：预测酶-底物催化效率 (kcat/KM) 用于底物偏好排序。
+
+    架构：
+      - pKd 路径（底物级）：配体 GNN + 蛋白结构/口袋 + 辅因子 → InteractionModule → pKd
+      - kcat 路径（蛋白级）：ESM-2 + 辅因子嵌入 → KcatPredictor MLP → log_kcat
+      - 两条路径分离，输出端汇合：score = pKd + log_kcat = log10(kcat/KM)
 
     输入：蛋白序列嵌入 + 配体分子图 + 辅因子类型
     输出：pKd (约束[2,15]) + λ (重组能偏移) + log10(kcat)
-    损失：L_total = L_pkd + L_kcat（无物理约束）
+    损失：L_total = L_score(kcat/KM) + L_pkd_fallback(无kcat标签的样本)
     """
 
     COFACTOR_TYPES = sorted(COFACTOR_PRIORS.keys())
@@ -843,6 +883,12 @@ class MarcusPINN(nn.Module):
         # 预测头
         self.head = MultiTaskHead(hidden_dim=hidden_dim)
 
+        # kcat 预测器（蛋白级，独立路径 — 不与 pKd 共享表征）
+        self.kcat_predictor = KcatPredictor(
+            seq_embed_dim=1280, cofactor_dim=cofactor_embed_dim,
+            hidden_dim=hidden_dim,
+        )
+
         # 物理损失和OT正则化已移除（Marcus方程经验证不适用于当前数据集）
         # λ 预测头保留，但不再参与损失计算
 
@@ -861,9 +907,9 @@ class MarcusPINN(nn.Module):
                 ) -> dict[str, torch.Tensor]:
         """
         Returns:
-          pkd:           predicted pKd (B,)
+          pkd:           predicted pKd (B,) — 底物级结合亲和力 (InteractionModule → head)
           lambda_total:  predicted reorganization energy (eV) (B,)
-          log_kcat:      predicted log10(kcat) (B,)
+          log_kcat:      predicted log10(kcat) (B,) — 蛋白级催化速率 (KcatPredictor)
           cofactor_embed: cofactor embedding (B, cofactor_embed_dim)
         """
         # 编码
@@ -883,11 +929,12 @@ class MarcusPINN(nn.Module):
         cofactor_h, lambda_offset = self.cofactor_encoder(cofactor_strs)
         cofactor_h_proj = self.cofactor_proj(cofactor_h)
 
-        # 交互
+        # 交互 → pKd + λ (底物级路径)
         combined = self.interaction(protein_h, ligand_h, cofactor_h_proj)
+        pkd, lambda_offset_head = self.head(combined)
 
-        # 预测
-        pkd, lambda_offset_head, log_kcat = self.head(combined)
+        # kcat 预测 (蛋白级路径 — 独立，不经过交互模块)
+        log_kcat = self.kcat_predictor(seq_embed, cofactor_h)
 
         # λ_total = λ_prior + λ_offset (cofactor) + λ_offset (head)
         lambda_prior_batch = torch.tensor([
@@ -913,13 +960,20 @@ class MarcusPINN(nn.Module):
                      batch: dict,
                      ) -> tuple[torch.Tensor, dict]:
         """
-        复合损失函数：pKd + kcat。
+        统一催化效率损失函数：直接优化 kcat/KM（酶学适配性标准指标）。
+
+        设计原则：
+          - 主损失 L_score：直接优化 (pKd + log_kcat) = log10(kcat/KM)
+            模型自由分配 pKd 和 kcat 的预测误差来最小化组合误差
+          - 回退 L_pkd_fallback：对无 kcat 标签的样本 (18%)，退化为纯 pKd 损失
+          - 监控指标：L_pkd_monitor 和 L_kcat_monitor 仅用于日志，不参与梯度
 
         Args:
           outputs: forward() 的输出
           batch:   {
-            pkd_target, log_kcat_target, cofactor_strs,
-            quality_weight (含 thermo_weight), is_censored
+            pkd_target, log_kcat_target,
+            pkd_target_mask, kcat_target_mask,
+            quality_weight (含 thermo_weight),
           }
 
         Returns:
@@ -929,48 +983,66 @@ class MarcusPINN(nn.Module):
         log_kcat_pred = outputs["log_kcat"]
 
         losses = {}
-
-        # ── 数据损失 ──
         quality_weight = batch.get("quality_weight", torch.ones_like(pkd_pred))
-
-        # pKd 损失 (仅对有标签的样本)
         pkd_mask = batch.get("pkd_target_mask", torch.ones_like(pkd_pred, dtype=torch.bool))
-        if pkd_mask.any():
-            pkd_diff = pkd_pred[pkd_mask] - batch["pkd_target"][pkd_mask]
-            losses["L_pkd"] = (quality_weight[pkd_mask] * F.smooth_l1_loss(
-                pkd_diff, torch.zeros_like(pkd_diff), reduction='none'
-            )).mean()
-        else:
-            losses["L_pkd"] = torch.tensor(0.0, device=pkd_pred.device)
-
-        # kcat 损失 (按数据源加权 × 测量质量加权)
         kcat_mask = batch.get("kcat_target_mask", torch.zeros_like(log_kcat_pred, dtype=torch.bool))
-        if kcat_mask.any():
-            kcat_diff = log_kcat_pred[kcat_mask] - batch["log_kcat_target"][kcat_mask]
-            # 数据源权重 (BRENDA+SABIO=1.0, SABIO-only=0.9, BindingDB-only=0.7)
-            kcat_w = batch.get("kcat_weights", torch.ones_like(kcat_diff))
-            if isinstance(kcat_w, torch.Tensor) and kcat_w.numel() > 1:
-                kcat_w = kcat_w[kcat_mask]
-            qw = quality_weight[kcat_mask] if quality_weight.numel() > 1 else quality_weight
-            per_sample_w = kcat_w * qw
-            losses["L_kcat"] = (per_sample_w * F.smooth_l1_loss(
-                kcat_diff, torch.zeros_like(kcat_diff), reduction='none'
+
+        # 样本分组
+        both_mask = pkd_mask & kcat_mask              # 有 pKd + kcat：用 kcat/KM
+        pkd_only_mask = pkd_mask & ~kcat_mask          # 仅有 pKd：回退到 pKd 损失
+
+        # ── 主损失：kcat/KM = pKd + log10(kcat) ──
+        if both_mask.any():
+            score_pred = pkd_pred[both_mask] + log_kcat_pred[both_mask]
+            score_true = batch["pkd_target"][both_mask] + batch["log_kcat_target"][both_mask]
+            diff = score_pred - score_true
+            losses["L_score"] = (quality_weight[both_mask] * F.smooth_l1_loss(
+                diff, torch.zeros_like(diff), reduction='none'
             )).mean()
         else:
-            losses["L_kcat"] = torch.tensor(0.0, device=log_kcat_pred.device)
+            losses["L_score"] = torch.tensor(0.0, device=pkd_pred.device)
+
+        # ── 回退损失：纯 pKd (无 kcat 标签的样本) ──
+        if pkd_only_mask.any():
+            diff = pkd_pred[pkd_only_mask] - batch["pkd_target"][pkd_only_mask]
+            losses["L_pkd_fallback"] = (quality_weight[pkd_only_mask] * F.smooth_l1_loss(
+                diff, torch.zeros_like(diff), reduction='none'
+            )).mean()
+        else:
+            losses["L_pkd_fallback"] = torch.tensor(0.0, device=pkd_pred.device)
+
+        # ── 监控指标（不参与梯度，仅用于日志） ──
+        if pkd_mask.any():
+            diff = pkd_pred[pkd_mask] - batch["pkd_target"][pkd_mask]
+            losses["L_pkd_monitor"] = F.l1_loss(diff, torch.zeros_like(diff))
+        else:
+            losses["L_pkd_monitor"] = torch.tensor(0.0, device=pkd_pred.device)
+
+        if kcat_mask.any():
+            diff = log_kcat_pred[kcat_mask] - batch["log_kcat_target"][kcat_mask]
+            losses["L_kcat_monitor"] = F.l1_loss(diff, torch.zeros_like(diff))
+        else:
+            losses["L_kcat_monitor"] = torch.tensor(0.0, device=log_kcat_pred.device)
 
         # ── 总损失 ──
-        total = losses["L_pkd"] + losses["L_kcat"]
+        total = losses["L_score"] + losses["L_pkd_fallback"]
         losses["total"] = total
 
         return total, losses
 
     def predict_activation_barrier(self, outputs: dict) -> torch.Tensor:
-        """辅助函数：从模型输出计算预测的 ΔG‡ (kJ/mol)"""
-        physics_fn = self.physics_loss_fn
-        delta_g = physics_fn._delta_g_from_pkd(outputs["pkd"])
-        barrier = physics_fn._marcus_barrier(delta_g, outputs["lambda"])
-        return barrier
+        """辅助函数：从模型输出计算预测的 ΔG‡ (kJ/mol)。
+
+        使用 Marcus 方程 ΔG‡ = (λ + ΔG°)² / (4λ)。
+        注意：此函数仅供分析参考，Marcus 约束已从训练损失中移除
+        （经验证 kcat_true / kcat_marcus ≈ 10⁻⁶）。
+        """
+        delta_g_kj = DELTA_G_FACTOR * outputs["pkd"]     # kJ/mol
+        lambda_ev = outputs["lambda"]                      # eV
+        lambda_kj = lambda_ev * 23.0605 * 4.184            # eV → kcal → kJ
+        numerator = (lambda_kj + delta_g_kj) ** 2
+        denominator = 4 * lambda_kj + 1e-8
+        return numerator / denominator
 
     def predict_catalytic_efficiency(self, outputs: dict) -> torch.Tensor:
         """辅助函数：计算 log10(kcat/KM) from pKd + kcat"""
@@ -1031,19 +1103,21 @@ if __name__ == "__main__":
               f"{'δ='+str(prior.delta) if prior.delta else ''}"
               f"{'λ_p='+str(prior.lambda_p) if prior.lambda_p else ''}")
 
-    print(f"\n  编码器:")
+    print(f"  编码器:")
     print(f"    LigandEncoder:  GATv2Conv × {model.ligand_encoder.convs.__len__()}")
     print(f"    ProteinEncoder: ESM-2 1280-dim → {model.hidden_dim}-dim")
     print(f"    CofactorEncoder: {model.cofactor_encoder.num_types} types → {model.cofactor_embed_dim}-dim")
+    print(f"    KcatPredictor: ESM-2 1280-dim + cofactor 64-dim → MLP → log_kcat (独立路径)")
 
     print(f"\n  输出头:")
-    print(f"    pKd:      结合亲和力 (−log10 Kd)，约束 [2, 15]")
-    print(f"    λ:        重组能 (eV), 辅因子先验 + 可学习偏移")
-    print(f"    log_kcat: log10 催化速率常数 (s⁻¹)")
+    print(f"    pKd:      结合亲和力 (−log10 Kd)，约束 [2, 15] (InteractionModule → head)")
+    print(f"    log_kcat: log10 催化速率常数 (s⁻¹) (KcatPredictor, 蛋白级独立路径)")
+    print(f"    λ:        重组能 (eV), 辅因子先验 + 可学习偏移 (保留，不参与损失)")
 
     print(f"\n  损失函数:")
-    print(f"    L_total = L_pkd + L_kcat")
-    print(f"    - L_pkd:  按热力学分层权重 (Kd=1.0, Ki=0.7, IC50=0.15)")
-    print(f"    - L_kcat: 蛋白级辅助回归，按数据源加权")
+    print(f"    L_total = L_score(kcat/KM) + L_pkd_fallback(无kcat样本)")
+    print(f"    - L_score:  直接优化 pKd + log_kcat = log10(kcat/KM)")
+    print(f"    - L_pkd_fallback: 无kcat标签时回退为纯pKd损失")
+    print(f"    - 监控: L_pkd_monitor, L_kcat_monitor (不参与梯度)")
 
     print("\n  ✓ 模型结构验证通过")

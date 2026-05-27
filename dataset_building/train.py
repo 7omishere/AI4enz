@@ -448,7 +448,7 @@ class Trainer:
 
             # 进度条
             pbar.set_postfix({
-                "loss": f"{total_loss.item():.3f}",
+                "score": f"{total_loss.item():.3f}",
                 "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
             })
 
@@ -549,8 +549,9 @@ class Trainer:
                 f"train: {train_losses['total']:.4f}  "
                 f"val: {val_losses['total']:.4f}  "
                 f"(best: {self.best_val_loss:.4f})  |  "
-                f"L_pkd: {train_losses.get('L_pkd', 0):.4f}  "
-                f"L_kcat: {train_losses.get('L_kcat', 0):.4f}"
+                f"L_score: {train_losses.get('L_score', 0):.4f}  "
+                f"pkd_mae: {train_losses.get('L_pkd_monitor', 0):.4f}  "
+                f"kcat_mae: {train_losses.get('L_kcat_monitor', 0):.4f}"
             )
 
             # 保存最佳
