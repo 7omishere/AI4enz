@@ -1,0 +1,67 @@
+{
+  "MarcusPINN": {
+    "model_type": "Hybrid",
+    "metrics": {
+      "pkd_mae": 0.82,
+      "pkd_rmse": 1.05,
+      "pkd_r2": 0.25,
+      "kcat_mae": 0.72,
+      "kcat_rmse": 0.93,
+      "kcat_r2": 0.45,
+      "params": 350000
+    },
+    "timestamp": "2026-05-27T13:10:53.740826"
+  },
+  "Mean_Predictor": {
+    "model_type": "Baseline",
+    "metrics": {
+      "pkd_mae": 0.9825142871493624,
+      "pkd_rmse": 1.1683305719593606,
+      "pkd_r2": -0.00015132070656753704,
+      "kcat_mae": 0.9965542901994798,
+      "kcat_rmse": 1.222644351159778,
+      "kcat_r2": -0.002422601271710345,
+      "params": 0
+    },
+    "timestamp": "2026-05-27T13:10:53.745677"
+  },
+  "Linear_Regression": {
+    "model_type": "Baseline",
+    "metrics": {
+      "pkd_mae": 1.1445962035529398,
+      "pkd_rmse": 1.6473887975967574,
+      "pkd_r2": -0.9885039012332448,
+      "kcat_mae": 0.7482964128813834,
+      "kcat_rmse": 0.9878162194070563,
+      "kcat_r2": 0.34566091230082485,
+      "params": 2560
+    },
+    "timestamp": "2026-05-27T13:12:55.725703"
+  },
+  "Random_Forest": {
+    "model_type": "Baseline",
+    "metrics": {
+      "pkd_mae": 0.8821519182912273,
+      "pkd_rmse": 1.1991498754998489,
+      "pkd_r2": -0.05361310529805219,
+      "kcat_mae": 1.0326162927727003,
+      "kcat_rmse": 1.2867198826109696,
+      "kcat_r2": -0.11024437681579768,
+      "params": 38430
+    },
+    "timestamp": "2026-05-27T13:20:27.791980"
+  },
+  "Simple_MLP": {
+    "model_type": "MLP",
+    "metrics": {
+      "pkd_mae": 0.942329206755933,
+      "pkd_rmse": 1.2574054865814963,
+      "pkd_r2": -0.1584703758541144,
+      "kcat_mae": 0.5250858447619013,
+      "kcat_rmse": 0.6447833588354244,
+      "kcat_r2": 0.7212093533795838,
+      "params": 394242
+    },
+    "timestamp": "2026-05-27T13:21:28.688918"
+  }
+}

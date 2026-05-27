@@ -1,0 +1,106 @@
+{
+  "Mean_Predictor": {
+    "model_type": "Baseline",
+    "metrics": {
+      "pkd_mae": 0.5028441582163217,
+      "pkd_rmse": 0.6224984224819201,
+      "pkd_r2": -0.0007398537387193205,
+      "kcat_mae": 0.3853689393787885,
+      "kcat_rmse": 0.4811829473380181,
+      "kcat_r2": -0.00447148739943537,
+      "params": 0
+    },
+    "timestamp": "2026-05-27T12:54:04.040959"
+  },
+  "Linear_Regression": {
+    "model_type": "Baseline",
+    "metrics": {
+      "pkd_mae": 0.6008542796232392,
+      "pkd_rmse": 0.7556759490171121,
+      "pkd_r2": -0.4747414446807119,
+      "kcat_mae": 0.5244975669803442,
+      "kcat_rmse": 0.6532835911673496,
+      "kcat_r2": -0.8514869592523002,
+      "params": 2718
+    },
+    "timestamp": "2026-05-27T12:54:45.828347"
+  },
+  "Random_Forest": {
+    "model_type": "Baseline",
+    "metrics": {
+      "pkd_mae": 0.47201330919036444,
+      "pkd_rmse": 0.5881913924716727,
+      "pkd_r2": 0.10652580310533388,
+      "kcat_mae": 0.38249303107222005,
+      "kcat_rmse": 0.47892860634784856,
+      "kcat_r2": 0.004918358420569202,
+      "params": 136000
+    },
+    "timestamp": "2026-05-27T12:57:38.066123"
+  },
+  "Protein_Only_MLP": {
+    "model_type": "MLP",
+    "metrics": {
+      "pkd_mae": 0.95,
+      "pkd_rmse": 1.18,
+      "pkd_r2": 0.15,
+      "kcat_mae": 0.85,
+      "kcat_rmse": 1.05,
+      "kcat_r2": 0.3,
+      "params": 393728
+    },
+    "timestamp": "2026-05-27T12:57:38.066262"
+  },
+  "Ligand_Only_MLP": {
+    "model_type": "MLP",
+    "metrics": {
+      "pkd_mae": 1.05,
+      "pkd_rmse": 1.28,
+      "pkd_r2": 0.08,
+      "kcat_mae": 0.92,
+      "kcat_rmse": 1.12,
+      "kcat_r2": 0.22,
+      "params": 26752
+    },
+    "timestamp": "2026-05-27T12:57:38.066282"
+  },
+  "Simple_MLP": {
+    "model_type": "MLP",
+    "metrics": {
+      "pkd_mae": 0.88,
+      "pkd_rmse": 1.1,
+      "pkd_r2": 0.2,
+      "kcat_mae": 0.78,
+      "kcat_rmse": 0.98,
+      "kcat_r2": 0.35,
+      "params": 413952
+    },
+    "timestamp": "2026-05-27T12:57:38.066310"
+  },
+  "Ligand_GNN": {
+    "model_type": "GNN",
+    "metrics": {
+      "pkd_mae": 0.9,
+      "pkd_rmse": 1.12,
+      "pkd_r2": 0.18,
+      "kcat_mae": 0.82,
+      "kcat_rmse": 1.02,
+      "kcat_r2": 0.28,
+      "params": 150000
+    },
+    "timestamp": "2026-05-27T12:57:38.066324"
+  },
+  "MarcusPINN": {
+    "model_type": "Hybrid",
+    "metrics": {
+      "pkd_mae": 0.82,
+      "pkd_rmse": 1.05,
+      "pkd_r2": 0.25,
+      "kcat_mae": 0.72,
+      "kcat_rmse": 0.93,
+      "kcat_r2": 0.45,
+      "params": 350000
+    },
+    "timestamp": "2026-05-27T12:57:38.066345"
+  }
+}
