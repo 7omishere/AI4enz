@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+
+# Large data — 另行下载/生成
+dataset_building/data/
+dataset_building/processed/
+
+# Checkpoints
+dataset_building/checkpoints/*
+!dataset_building/checkpoints/.gitkeep
+
+# Runtime artifacts
+dataset_building/execution_trace/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude/Codex/OpenCode local config
+.claude/
+.executor/
+.pantheon/
+.notebook_contexts.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Analysis results
+baseline_comparison/
+baseline_comparison_real/
+ablation_results/
+
+# Evaluation scripts
+dataset_building/ablation_study.py
+dataset_building/analyze_metrics.py
+dataset_building/baseline_comparison.py
+dataset_building/baseline_comparison_real.py
+dataset_building/diagnose_fluctuation.py
+dataset_building/evaluate_model.py
+dataset_building/plot_evaluation.py
+dataset_building/plot_full_losses.py
+dataset_building/plot_losses.py
+dataset_building/plot_training_losses.py
+
+# Misc
+*.log
+*.tar.gz
+tmp/
