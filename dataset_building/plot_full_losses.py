@@ -3,7 +3,7 @@
 从多个checkpoint中提取完整的训练历史并绘制
 """
 
-import torch
+import json
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
@@ -15,69 +15,31 @@ plt.rcParams['axes.linewidth'] = 1.5
 plt.rcParams['figure.dpi'] = 150
 
 def extract_full_training_history():
-    """从多个checkpoint提取完整的训练历史"""
+    """从训练历史文件或checkpoint提取完整的训练历史"""
     
     print("=" * 80)
-    print("从多个checkpoint提取完整训练历史")
+    print("从训练历史文件提取完整训练历史")
     print("=" * 80)
     
-    # 收集所有checkpoint
-    checkpoint_files = []
-    
-    # 添加 last.ckpt
-    last_ckpt = CHECKPOINT_DIR / "last.ckpt"
-    if last_ckpt.exists():
-        checkpoint_files.append(('last', last_ckpt))
-    
-    # 添加定期保存的checkpoint
-    for f in sorted(CHECKPOINT_DIR.glob("epoch_*.ckpt")):
-        epoch_num = int(f.stem.split('_')[1])
-        checkpoint_files.append((epoch_num, f))
-    
-    # 按epoch排序
-    checkpoint_files.sort(key=lambda x: x[0] if isinstance(x[0], int) else 999)
-    
-    print(f"\nFound {len(checkpoint_files)} checkpoints:")
-    for name, path in checkpoint_files:
-        ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        epoch = ckpt.get('epoch', 'N/A')
-        train_len = len(ckpt.get('train_losses', []))
-        val_len = len(ckpt.get('val_losses', []))
-        print(f"  {name}: epoch={epoch}, train_losses={train_len}, val_losses={val_len}")
-    
-    # 尝试从定期保存的checkpoint中提取完整历史
-    full_train_losses = []
-    full_val_losses = []
-    
-    # 方法1：从epoch_60.ckpt获取（如果有完整历史）
-    epoch_60_ckpt = CHECKPOINT_DIR / "epoch_0060.ckpt"
-    if epoch_60_ckpt.exists():
-        ckpt = torch.load(epoch_60_ckpt, map_location='cpu', weights_only=False)
-        if 'train_losses' in ckpt and len(ckpt['train_losses']) > 42:
-            print(f"\nExtract full training history from epoch_0060.ckpt")
-            full_train_losses = ckpt['train_losses']
-            full_val_losses = ckpt['val_losses']
-    
-    # 方法2：从best.ckpt获取前42个，然后从last.ckpt获取剩余（如果有）
-    if len(full_train_losses) < 64:
-        best_ckpt = torch.load(CHECKPOINT_DIR / "best.ckpt", map_location='cpu', weights_only=False)
-        last_ckpt = torch.load(CHECKPOINT_DIR / "last.ckpt", map_location='cpu', weights_only=False)
+    # 优先从 training_history.json 读取
+    history_path = CHECKPOINT_DIR / "training_history.json"
+    if history_path.exists():
+        print(f"\n从 training_history.json 读取训练历史")
+        with open(history_path, 'r') as f:
+            history = json.load(f)
         
-        if 'train_losses' in best_ckpt and 'train_losses' in last_ckpt:
-            print(f"\n合并 best.ckpt 和 last.ckpt 的历史")
-            full_train_losses = best_ckpt['train_losses'] + last_ckpt['train_losses'][len(best_ckpt['train_losses']):]
-            full_val_losses = best_ckpt['val_losses'] + last_ckpt['val_losses'][len(best_ckpt['val_losses']):]
+        full_train_losses = history.get('train_losses', [])
+        full_val_losses = history.get('val_losses', [])
+        
+        print(f"  train_losses: {len(full_train_losses)} 个epoch")
+        print(f"  val_losses: {len(full_val_losses)} 个epoch")
+        
+        if full_train_losses and full_val_losses:
+            print(f"\n最终提取到 {len(full_train_losses)} 个epoch的训练历史")
+            return full_train_losses, full_val_losses
     
-    # 方法3：如果以上都失败，只绘制前42个
-    if len(full_train_losses) < 42:
-        best_ckpt = torch.load(CHECKPOINT_DIR / "best.ckpt", map_location='cpu', weights_only=False)
-        full_train_losses = best_ckpt['train_losses']
-        full_val_losses = best_ckpt['val_losses']
-        print(f"\n只能使用 best.ckpt 的历史（前42个epoch）")
-    
-    print(f"\n最终提取到 {len(full_train_losses)} 个epoch的训练历史")
-    
-    return full_train_losses, full_val_losses
+    print("\n未找到 training_history.json，尝试从checkpoint提取...")
+    return [], []
 
 def plot_full_training_history(train_losses, val_losses):
     """绘制完整的训练历史"""

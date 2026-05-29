@@ -407,6 +407,8 @@ class Trainer:
                 k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
+            # 特殊处理 PyG Batch 对象
+            batch_gpu["ligand_data"] = batch_gpu["ligand_data"].to(self.device)
 
             # 前向
             outputs = self.model(
@@ -443,8 +445,10 @@ class Trainer:
             self.optimizer.step()
             self.scheduler.step()
 
-            # 累加
+            # 累加（跳过 weights 字典）
             for k, v in losses.items():
+                if k == 'weights':
+                    continue
                 epoch_losses.setdefault(k, 0.0)
                 epoch_losses[k] += v.item()
 
@@ -468,6 +472,8 @@ class Trainer:
                 k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
+            # 特殊处理 PyG Batch 对象
+            batch_gpu["ligand_data"] = batch_gpu["ligand_data"].to(self.device)
 
             outputs = self.model(
                 batch_gpu["ligand_data"],
@@ -495,7 +501,10 @@ class Trainer:
                 },
             )
 
+            # 累加（跳过 weights 字典）
             for k, v in losses.items():
+                if k == 'weights':
+                    continue
                 val_losses.setdefault(k, 0.0)
                 val_losses[k] += v.item()
 
@@ -587,6 +596,8 @@ class Trainer:
                 k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
+            # 特殊处理 PyG Batch 对象
+            batch_gpu["ligand_data"] = batch_gpu["ligand_data"].to(self.device)
             outputs = self.model(
                 batch_gpu["ligand_data"],
                 batch_gpu["seq_embed"],
@@ -611,7 +622,10 @@ class Trainer:
                     "quality_weight": batch_gpu["quality_weight"],
                 },
             )
+            # 累加（跳过 weights 字典）
             for k, v in losses.items():
+                if k == 'weights':
+                    continue
                 total_losses.setdefault(k, 0.0)
                 total_losses[k] += v.item()
 

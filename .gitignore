@@ -16,6 +16,9 @@ dataset_building/processed/
 # Checkpoints
 dataset_building/checkpoints/*
 !dataset_building/checkpoints/.gitkeep
+!dataset_building/checkpoints/*.png
+!dataset_building/checkpoints/*.json
+!dataset_building/checkpoints/training_history.json
 
 # Runtime artifacts
 dataset_building/execution_trace/
