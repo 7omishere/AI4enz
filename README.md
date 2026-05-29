@@ -1,54 +1,55 @@
-# AI4enz - Enzyme Mining and Activity Prediction
+# AI4enz — Enzyme Mining and Activity Prediction
 
-Machine learning models for predicting enzyme-substrate binding affinity (pKd) and catalytic efficiency (kcat/KM).
+基于过渡态理论的酶-底物结合亲和力（pKd）与催化效率（kcat/KM）预测模型。
 
 ## Quick Start
 
 ```bash
 cd dataset_building
 
-# Train with high-quality Kd/Ki data (recommended)
-python train.py --unified-metadata processed/oxidoreductase/high_quality_kd_ki.parquet \
+# 使用高质量 Kd/Ki 数据训练（推荐）
+python train.py --unified-metadata processed/oxidoreductase/high_quality_kd_ki_v2.parquet \
   --epochs 50 --batch-size 64 --device cuda
 
-# Quick test (CPU)
-python train.py --unified-metadata processed/oxidoreductase/high_quality_kd_ki.parquet \
+# 快速验证 (CPU)
+python train.py --unified-metadata processed/oxidoreductase/high_quality_kd_ki_v2.parquet \
   --epochs 10 --batch-size 32 --max-samples 5000 --device cpu
 ```
+
+## Architecture
+
+**TransitionBINN** — Hybrid 双路径设计：
+- **pKd 路径**：Ligand GNN + Protein (ESM-2 + 口袋结构) + Cofactor → pKd
+- **kcat 路径**：Protein ESM-2 + Cofactor → log₁₀(kcat)
+- **Score**：pKd + log_kcat = log₁₀(kcat/KM)
+
+## Dataset (v2)
+
+| Metric | Value |
+|--------|-------|
+| Total samples | **322,763** |
+| High-quality (Kd/Ki) | **163,927** |
+| Proteins | **11,044** |
+| Ligands | **141,941** |
+
+数据来源：CatPred-DB, OED, SKiD, BindingDB（详见 CLAUDE.md）
 
 ## Project Structure
 
 ```
 AI4enz/
-├── datepre/
-│   └── ranking_model.py   # Hybrid TransitionBINN model
-└── dataset_building/
-    ├── train.py           # Training script
-    ├── inference_enzyme_mining.py  # Inference
-    └── processed/         # Dataset (get separately)
+├── CLAUDE.md                    # 项目文档
+├── README.md                    # 本文件
+└── dataset_building/            # 所有代码与数据
+    ├── ranking_model.py         # TransitionBINN 模型
+    ├── train.py                 # 训练
+    ├── inference_enzyme_mining.py # 推理
+    ├── external_data/           # 外部数据源
+    └── processed/               # 处理输出
 ```
-
-## Architecture
-
-TransitionBINN with dual-pathway design:
-- **pKd pathway**: Ligand GNN + Protein structure + Cofactor → pKd
-- **kcat predictor**: ESM-2 + Cofactor → log₁₀(kcat)
-- **score**: pKd + log_kcat = log₁₀(kcat/KM)
-
-## Dataset
-
-| Metric | Value |
-|--------|-------|
-| Total samples | 78,113 |
-| High-quality (Kd/Ki) | 6,184 |
-| Proteins | 541 |
-| Ligands | 57,203 |
 
 ## Requirements
 
-- PyTorch ≥ 2.0
-- PyTorch Geometric
+- PyTorch ≥ 2.0 + PyTorch Geometric
 - ESM-2 (transformers)
 - RDKit
-
-See [CLAUDE.md](CLAUDE.md) for details.

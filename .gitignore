@@ -12,6 +12,7 @@ venv/
 # Large data — 另行下载/生成
 dataset_building/data/
 dataset_building/processed/
+dataset_building/external_data/
 
 # Checkpoints
 dataset_building/checkpoints/*
