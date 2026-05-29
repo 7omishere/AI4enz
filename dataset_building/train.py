@@ -41,8 +41,7 @@ from tqdm import tqdm
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "datepre"))
 from ranking_model import (
-    MarcusPINN, COFACTOR_PRIORS,
-    create_optimizer, DELTA_G_FACTOR, RT_kcal, T_ref,
+    TransitionBINN, create_bin_optimizer,
 )
 
 logging.basicConfig(
@@ -359,24 +358,31 @@ class Trainer:
     """训练循环封装"""
 
     def __init__(self,
-                 model: MarcusPINN,
+                 model: nn.Module,
                  train_loader: DataLoader,
                  val_loader: DataLoader,
                  test_loader: Optional[DataLoader] = None,
-                 lr: float = 5e-5,
+                 lr: float = 1e-4,
                  weight_decay: float = 1e-5,
                  device: str = "cuda",
                  checkpoint_dir: str = "checkpoints",
+                 optimizer_fn=None,
+                 model_type: str = "bin",
                  ):
         self.model = model.to(device)
         self.device = device
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
+        self.model_type = model_type
 
         self.global_step = 0
 
-        self.optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
+        if optimizer_fn is not None:
+            self.optimizer = optimizer_fn(model, lr=lr, weight_decay=weight_decay)
+        else:
+            self.optimizer = create_bin_optimizer(model, lr=lr, weight_decay=weight_decay)
+        
         self.scheduler = CosineAnnealingWarmRestarts(
             self.optimizer, T_0=5000, T_mult=2,
         )
@@ -397,14 +403,10 @@ class Trainer:
             self.global_step += 1
 
             # 移动到设备
-            batch_gpu = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch_gpu[k] = v.to(self.device)
-                elif hasattr(v, 'to') and hasattr(v, 'edge_index'):  # PyG Data object
-                    batch_gpu[k] = v.to(self.device)
-                else:
-                    batch_gpu[k] = v
+            batch_gpu = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 
             # 前向
             outputs = self.model(
@@ -448,7 +450,7 @@ class Trainer:
 
             # 进度条
             pbar.set_postfix({
-                "score": f"{total_loss.item():.3f}",
+                "loss": f"{total_loss.item():.3f}",
                 "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
             })
 
@@ -462,14 +464,10 @@ class Trainer:
         val_losses = {}
 
         for batch in tqdm(self.val_loader, desc="Validating", leave=False):
-            batch_gpu = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch_gpu[k] = v.to(self.device)
-                elif hasattr(v, 'to') and hasattr(v, 'edge_index'):  # PyG Data object
-                    batch_gpu[k] = v.to(self.device)
-                else:
-                    batch_gpu[k] = v
+            batch_gpu = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 
             outputs = self.model(
                 batch_gpu["ligand_data"],
@@ -544,15 +542,16 @@ class Trainer:
             self.val_losses.append(val_losses.get("total", 0))
 
             # 日志
-            log.info(
+            loss_info = (
                 f"Epoch {epoch:3d}/{epochs} | "
                 f"train: {train_losses['total']:.4f}  "
                 f"val: {val_losses['total']:.4f}  "
                 f"(best: {self.best_val_loss:.4f})  |  "
-                f"L_score: {train_losses.get('L_score', 0):.4f}  "
-                f"pkd_mae: {train_losses.get('L_pkd_monitor', 0):.4f}  "
-                f"kcat_mae: {train_losses.get('L_kcat_monitor', 0):.4f}"
+                f"L_ts: {train_losses.get('L_ts', 0):.4f}  "
+                f"L_cat: {train_losses.get('L_catalysis', 0):.4f}  "
+                f"L_barrier: {train_losses.get('L_barrier', 0):.4f}"
             )
+            log.info(loss_info)
 
             # 保存最佳
             val_total = val_losses["total"]
@@ -566,18 +565,10 @@ class Trainer:
 
             # 定期保存
             if epoch % save_every == 0:
-                self.save_checkpoint(f"epoch_{epoch:04d}.ckpt", {
-                    "epoch": epoch,
-                    "train_losses": self.train_losses,
-                    "val_losses": self.val_losses,
-                })
+                self.save_checkpoint(f"epoch_{epoch:04d}.ckpt", {"epoch": epoch})
 
             # 保存最新
-            self.save_checkpoint("last.ckpt", {
-                "epoch": epoch,
-                "train_losses": self.train_losses,
-                "val_losses": self.val_losses,
-            })
+            self.save_checkpoint("last.ckpt", {"epoch": epoch})
 
         # 最终评估
         if self.test_loader:
@@ -592,14 +583,10 @@ class Trainer:
         self.model.eval()
         total_losses = {}
         for batch in tqdm(loader, desc=desc, leave=False):
-            batch_gpu = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch_gpu[k] = v.to(self.device)
-                elif hasattr(v, 'to') and hasattr(v, 'edge_index'):  # PyG Data object
-                    batch_gpu[k] = v.to(self.device)
-                else:
-                    batch_gpu[k] = v
+            batch_gpu = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
             outputs = self.model(
                 batch_gpu["ligand_data"],
                 batch_gpu["seq_embed"],
@@ -637,7 +624,7 @@ class Trainer:
 # ─────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Marcus-PINN")
+    parser = argparse.ArgumentParser(description="Train TransitionBINN (基于过渡态理论)")
     # 数据
     parser.add_argument("--unified-metadata", default=str(
         OXIDOREDUCTASE_DIR / "unified_metadata.parquet"))
@@ -649,9 +636,13 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--max-samples", type=int, default=None)
-    # 模型
+    # 模型参数 (TransitionBINN)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--gnn-layers", type=int, default=3)
+    parser.add_argument("--n-ode-steps", type=int, default=5,
+                        help="BINN的ODE积分步数")
+    parser.add_argument("--no-gate", action="store_true",
+                        help="禁用BINN的门控机制")
     # 硬件
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num-workers", type=int, default=4)
@@ -664,6 +655,7 @@ def main():
     args = parser.parse_args()
 
     log.info(f"Device: {args.device}")
+    log.info("Using TransitionBINN model (Transition State Theory)")
 
     # ── 数据集 ──
     train_dataset = OxidoreductaseDataset(
@@ -695,11 +687,16 @@ def main():
         collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True,
     )
 
-    # ── 模型 ──
-    model = MarcusPINN(
+    # ── 模型（TransitionBINN） ──
+    model = TransitionBINN(
         hidden_dim=args.hidden_dim,
         gnn_layers=args.gnn_layers,
+        n_ode_steps=args.n_ode_steps,
+        use_gate=not args.no_gate,
     )
+    optimizer_fn = create_bin_optimizer
+    log.info("Using TransitionBINN model (Transition State Theory)")
+
     log.info(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
     # ── 训练器 ──
@@ -712,6 +709,7 @@ def main():
         weight_decay=args.weight_decay,
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
+        optimizer_fn=optimizer_fn,
     )
 
     if args.resume:

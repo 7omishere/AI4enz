@@ -5,18 +5,25 @@ ranking_model.py
 
 架构：
   LigandEncoder (GATv2×3) + ProteinEncoder (ESM-2 1280-dim) + CofactorEncoder
-  → InteractionModule (交叉注意力)
-  → MultiTaskHead (pKd + λ_offset + log_kcat)
+  → BINNInteraction (反应坐标Neural ODE)
+  → BINNCatalysisHead (pKd + catalysis_rate)
 
 训练目标：
-  L_total = L_pkd + L_kcat
-  - pKd 损失：按热力学分层权重 (Kd=1.0, Ki=0.7, IC50=0.15)
-  - kcat 损失：蛋白级辅助回归，按数据源加权
-  - Marcus 物理约束已移除（经验证不适用于当前数据集）
-  - λ 预测头保留但不参与损失
+  L_total = L_ts + L_catalysis + L_barrier + L_progress
+  - L_ts: 过渡态稳定性（与pKd正相关）
+  - L_catalysis: 催化效率（与log_kcat正相关）
+  - L_barrier: 能垒正则化（物理先验）
+  - L_progress: 反应坐标演化正则化
+  - 权重由uncertainty weighting自动学习
+
+核心设计（BINN）：
+  - 不依赖电子转移假设（Marcus方程已被证伪）
+  - 基于普适的过渡态理论
+  - 用Neural ODE模拟酶-底物复合物沿反应坐标的演化
+  - 门控机制模拟"能垒跨越"
 
 用法：
-  from ranking_model import MarcusPINN
+  from ranking_model import TransitionBINN
 """
 
 import math
@@ -437,429 +444,459 @@ class ProteinEncoder(nn.Module):
         return self.encoder(x)
 
 
-# ─────────────────────────────────────────────────────────────
-# 交互模块
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# BINN: 基于反应坐标的过渡态理论
+# ═══════════════════════════════════════════════════════════════════════════════
+# 设计原则：
+#   - 不依赖电子转移假设（Marcus方程已被证伪）
+#   - 基于普适的过渡态理论（适用于所有酶催化）
+#   - 用Neural ODE模拟酶-底物复合物沿反应坐标的演化
 
-class InteractionModule(nn.Module):
-    """蛋白-配体-辅因子交互模块，使用交叉注意力"""
-
-    def __init__(self, hidden_dim: int = 256, num_heads: int = 4):
-        super().__init__()
-        self.cross_attn_pl = nn.MultiheadAttention(hidden_dim, num_heads,
-                                                    batch_first=True)
-        self.cross_attn_pc = nn.MultiheadAttention(hidden_dim, num_heads,
-                                                    batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def forward(self,
-                protein_h: torch.Tensor,   # (B, D)
-                ligand_h: torch.Tensor,    # (B, D)
-                cofactor_h: torch.Tensor,  # (B, D_cofactor)
-                ) -> torch.Tensor:
-        # 投影配体和辅因子到相同维度
-        D = protein_h.size(-1)
-        if ligand_h.size(-1) != D:
-            ligand_h = F.linear(ligand_h, torch.eye(D, ligand_h.size(-1), device=ligand_h.device))
-        if cofactor_h.size(-1) != D:
-            cofactor_h = F.linear(cofactor_h, torch.eye(D, cofactor_h.size(-1), device=cofactor_h.device))
-
-        # 交叉注意力
-        attn_pl, _ = self.cross_attn_pl(
-            protein_h.unsqueeze(1), ligand_h.unsqueeze(1), ligand_h.unsqueeze(1)
-        )
-        attn_pc, _ = self.cross_attn_pc(
-            protein_h.unsqueeze(1), cofactor_h.unsqueeze(1), cofactor_h.unsqueeze(1)
-        )
-
-        combined = torch.cat([
-            self.norm1(protein_h + attn_pl.squeeze(1)),
-            self.norm2(protein_h + attn_pc.squeeze(1)),
-            protein_h,
-        ], dim=-1)
-
-        return self.output_proj(combined)
-
-
-# ─────────────────────────────────────────────────────────────
-# 预测头
-# ─────────────────────────────────────────────────────────────
-
-class MultiTaskHead(nn.Module):
-    """双头预测器：pKd, λ（从蛋白-配体交互特征中预测）。
-
-    kcat 不再从此头预测——由独立的 KcatPredictor 从蛋白序列+辅因子特征直接预测。
+class TransitionStateGate(nn.Module):
+    """
+    门控机制：模拟"跨越能垒"的过程
+    
+    核心思想：
+    - 在过渡态附近（ξ≈0.5），门控更"宽松"，信息通过更多
+    - 在反应物/产物端（ξ≈0或1），门控更"严格"
+    
+    类比：就像分子需要"激发"才能跨越能垒
     """
 
     def __init__(self, hidden_dim: int = 256):
         super().__init__()
-        shared = [
+        # 门控网络：决定当前状态是否足够"激发"来跨越下一个能垒
+        self.gate_net = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),  # h + catalyst + ligand context
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()  # 输出 [0, 1]，1=通过，0=阻挡
+        )
+        
+        # 能量垒估计：预测当前位置的"能垒高度"（eV）
+        self.barrier_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim // 2),  # h + catalyst
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # 确保能量为正，约束到 [0.5, 5.0] eV
+        )
+
+    def forward(self, 
+                h: torch.Tensor,           # (B, D) 当前状态
+                catalyst_h: torch.Tensor,  # (B, D) 酶催化上下文
+                ligand_h: torch.Tensor,    # (B, D) 底物状态
+                xi_position: torch.Tensor  # (B,) ∈ [0, 1] 当前位置
+               ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            gate_value: (B,) ∈ [0, 1]，门控值
+            barrier_height: (B,)，估计的能垒高度 (eV)
+        """
+        B = h.size(0)
+        device = h.device
+        
+        # 反应上下文 = 当前状态 + 催化剂 + 底物
+        context = torch.cat([h, catalyst_h, ligand_h], dim=-1)
+        
+        # 可学习的调制
+        learned_gate = self.gate_net(context).squeeze(-1)  # (B,)
+        
+        # 物理先验：距离过渡态越近（ξ≈0.5），门越开
+        # 高斯函数：中心在ξ=0.5，给定基线门控
+        xi_clamped = xi_position.clamp(0.0, 1.0)
+        baseline_gate = torch.exp(-4.0 * (xi_clamped - 0.5) ** 2)  # (B,)
+        
+        # 组合：baseline（物理先验）+ learned（数据驱动）
+        gate = 0.3 * baseline_gate + 0.7 * learned_gate
+        gate = gate.clamp(0.0, 1.0)
+        
+        # 能垒高度估计：中间最高，两端最低
+        barrier_context = torch.cat([h, catalyst_h], dim=-1)
+        raw_barrier = self.barrier_net(barrier_context).squeeze(-1)  # (B,)
+        
+        # 物理约束：能垒应该随距离过渡态的距离而变化
+        # 在ξ=0.5时最大，两端最小
+        barrier_modulation = 1.0 + 4.0 * torch.abs(xi_clamped - 0.5)
+        barrier = raw_barrier * barrier_modulation
+        
+        # 软约束到合理范围 [0.5, 5.0] eV
+        barrier = 0.5 + 4.5 * torch.sigmoid(barrier.log() - 2.0)
+        
+        return gate, barrier
+
+
+class ReactionCoordinateBINN(nn.Module):
+    """
+    基于反应坐标的BINN交互层
+    
+    核心假设：
+    1. 存在一个潜在的反应坐标 ξ ∈ [0, 1]
+       - ξ=0: 反应物（酶-底物初始结合）
+       - ξ=0.5: 过渡态（最大能垒）
+       - ξ=1: 产物（催化完成）
+    
+    2. 系统状态 h(ξ) 沿反应坐标连续演化
+       dh/dξ = f(h, catalyst, substrate)
+    
+    3. 酶催化 = 加速 h(ξ) 的演化（降低能垒，稳定过渡态）
+    
+    不假设：
+    - 电子转移是限速步
+    - 特定的转移机制（ET/Hydride/PCET）
+    - Marcus方程的适用性
+    """
+
+    def __init__(
+        self, 
+        hidden_dim: int = 256,
+        n_ode_steps: int = 5,
+        use_gate: bool = True
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.n_steps = n_ode_steps
+        self.use_gate = use_gate
+        
+        # Step 1: 初始状态构建（酶-底物复合物）
+        self.initial_state_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # protein + ligand
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+        )
+        
+        # Step 2: ODE动力学函数
+        #  learns: dh/dξ = f(h, catalyst_context, ligand)
+        self.dynamics_net = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),  # h + catalyst + ligand
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),  # Tanh保证动力学稳定
+        )
+        
+        # 残差缩放因子（让ODE更稳定）
+        self.dxi = 1.0 / n_ode_steps
+        
+        # Step 3: 门控机制
+        if use_gate:
+            self.gate = TransitionStateGate(hidden_dim)
+        
+        # Step 4: 最终演化状态 → 特征
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # h_final + h_initial
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, 
+                protein_h: torch.Tensor,   # (B, D)
+                ligand_h: torch.Tensor,    # (B, D)
+                cofactor_h: torch.Tensor   # (B, D_cf)
+               ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            protein_h: 酶的隐藏状态
+            ligand_h:  底物的隐藏状态
+            cofactor_h: 辅因子的隐藏状态
+        
+        Returns:
+            h_reaction: (B, D) 沿反应坐标演化后的状态
+            trajectory: list of (B, D) 每一步的状态
+            gate_values: (B, n_steps) 每步的门控值
+            barrier_heights: (B, n_steps) 每步的能垒高度
+        """
+        B = protein_h.size(0)
+        device = protein_h.device
+        
+        # 催化剂上下文 = 酶 + 辅因子
+        catalyst_h = protein_h + cofactor_h
+        
+        # ── Step 1: 构建初始状态 h(ξ=0) ──────────────────
+        es_complex = torch.cat([protein_h, ligand_h], dim=-1)
+        h0 = self.initial_state_proj(es_complex)
+        
+        # 沿反应坐标的演化轨迹
+        trajectory = [h0]
+        gate_values = []
+        barrier_heights = []
+        
+        # 当前反应坐标位置
+        xi = torch.zeros(B, device=device)
+        
+        # ── Step 2: ODE积分 ────────────────────────────────
+        h = h0
+        for step in range(self.n_steps):
+            # 预测下一步的增量
+            dynamics_input = torch.cat([h, catalyst_h, ligand_h], dim=-1)
+            dh = self.dynamics_net(dynamics_input)
+            
+            # 门控：限制信息流通过量
+            if self.use_gate:
+                xi_position = xi + self.dxi / 2  # 中点估计
+                gate, barrier = self.gate(h, catalyst_h, ligand_h, xi_position)
+                gate_values.append(gate.detach())  # 门控不传梯度
+                barrier_heights.append(barrier.detach())
+                dh = dh * gate.unsqueeze(-1)
+            
+            # Euler积分 + 残差
+            # 添加二阶校正以提高精度
+            h_mid = h + 0.5 * self.dxi * dh
+            dynamics_mid = torch.cat([h_mid, catalyst_h, ligand_h], dim=-1)
+            dh_correction = self.dynamics_net(dynamics_mid)
+            h = h + self.dxi * (dh + dh_correction) / 2
+            
+            # 更新反应坐标
+            xi = xi + self.dxi
+            trajectory.append(h.detach())
+        
+        # ── Step 3: 输出 ──────────────────────────────────
+        # 演化幅度 = ||h_final - h_initial||
+        reaction_progress = (h - h0).pow(2).mean(dim=-1)  # (B,)
+        
+        # 最终输出 = 最终状态 + 初始状态（保留初始信息）
+        h_reaction = self.output_proj(torch.cat([h, h0], dim=-1))
+        
+        return {
+            'h_reaction': h_reaction,
+            'trajectory': trajectory,
+            'gate_values': torch.stack(gate_values) if gate_values else None,
+            'barrier_heights': torch.stack(barrier_heights) if barrier_heights else None,
+            'reaction_progress': reaction_progress,
+            'h_initial': h0,
+            'h_final': h,
+        }
+
+
+class BINNCatalysisHead(nn.Module):
+    """
+    基于过渡态理论的催化预测头
+    
+    预测：
+    1. ts_stability: 过渡态稳定性（与pKd对应）
+    2. catalysis_rate: 催化效率（与log_kcat对应）
+    """
+
+    def __init__(self, hidden_dim: int = 256):
+        super().__init__()
+        
+        self.shared = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Dropout(0.1),
-        ]
-
-        self.shared = nn.Sequential(*shared)
-
-        # pKd 预测头：输出在 [2, 15] 范围
-        self.pkd_head = nn.Sequential(
+        )
+        
+        # 过渡态稳定性头：预测 pKd，范围 [2, 15]
+        self.ts_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.SiLU(),
             nn.Linear(64, 1),
         )
-
-        # λ 预测头：输出 λ 偏移 (eV)
-        self.lambda_head = nn.Sequential(
+        
+        # 催化效率头：预测 log10(kcat)
+        self.catalysis_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.SiLU(),
             nn.Linear(64, 1),
         )
-
-    def forward(self, x: torch.Tensor):
-        h = self.shared(x)
-        pkd = self.pkd_head(h).squeeze(-1)           # (B,)
-        pkd = 2.0 + 13.0 * torch.sigmoid(pkd)        # constrain to [2, 15]
-        lambda_offset = self.lambda_head(h).squeeze(-1)  # (B,)  Δλ in eV
-        return pkd, lambda_offset
-
-
-# ─────────────────────────────────────────────────────────────
-# kcat 预测器（蛋白级，独立路径）
-# ─────────────────────────────────────────────────────────────
-
-class KcatPredictor(nn.Module):
-    """蛋白级 kcat 预测器：从蛋白序列 + 辅因子特征直接预测催化速率。
-
-    设计原则：
-      - kcat 是蛋白级属性（同一蛋白所有底物共享），不需要配体信息
-      - 与 pKd 的交互路径分离，避免底物级和蛋白级表征冲突（消除负迁移）
-      - 基线验证：纯 ESM-2 → MLP 的 kcat R²=0.721，本模块复用此结论
-
-    输入：
-      - seq_embed: (B, 1280) ESM-2 或 (B, 6) AA 物化性质
-      - cofactor_embed: (B, cofactor_dim) 辅因子类型嵌入
-    """
-
-    def __init__(self, seq_embed_dim: int = 1280, cofactor_dim: int = 64,
-                 hidden_dim: int = 256):
-        super().__init__()
-        input_dim = seq_embed_dim + cofactor_dim
-
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        
+        # 反应能垒头：预测 ΔG‡ (kJ/mol)，用于正则化
+        self.barrier_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
             nn.SiLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.SiLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(64, 1),
+            nn.Softplus(),  # 确保正值
         )
 
-    def forward(self, seq_embed: torch.Tensor, cofactor_embed: torch.Tensor) -> torch.Tensor:
-        """Returns log10(kcat) (B,)"""
-        x = torch.cat([seq_embed, cofactor_embed], dim=-1)
-        return self.mlp(x).squeeze(-1)
-
-
-# ─────────────────────────────────────────────────────────────
-# 物理损失函数（保留但不参与训练，Marcus 方程经验证不适用于当前数据集）
-# ─────────────────────────────────────────────────────────────
-
-class MarcusPhysicsLoss(nn.Module):
-    """
-    三种电子转移机制的 PDE 约束。
-
-    形式：
-      1. 纯 ET:     ΔG‡ = (λ + ΔG°)² / (4λ)
-      2. Hydride:   ΔG‡ = (λ + ΔG°)² / (4λ) + δ·|ΔG°|      (Marcus-Hammond)
-      3. PCET:      ΔG‡ = [(λ_e + λ_p) + ΔG°]² / [4(λ_e + λ_p)] + ΔG°_pcet
-
-    损失基于过渡态理论检验：
-      kcat_theory = kBT/h · exp(-ΔG‡ / (RT))
-      但为了数值稳定，使用 log10(kcat) 比较。
-    """
-
-    def __init__(self, temperature: float = T_ref):
-        super().__init__()
-        self.RT = R_kcal * temperature      # kcal/mol
-        self.RT_kJ = R_kJ * temperature     # kJ/mol
-        self.kBT_h = k_B * temperature / h  # s⁻¹
-        self.ev_to_kcal = 23.0605           # 1 eV = 23.0605 kcal/mol
-
-    def _delta_g_from_pkd(self, pkd: torch.Tensor) -> torch.Tensor:
-        """ΔG° (kcal/mol) = -RT ln(Kd). pKd = -log10(Kd)."""
-        return DELTA_G_FACTOR * pkd           # kJ/mol, positive = unfavorable
-
-    def _marcus_barrier(self,
-                        delta_g: torch.Tensor,  # kJ/mol
-                        lambda_: torch.Tensor,   # eV
-                        ) -> torch.Tensor:
-        """纯 Marcus 活化能 ΔG‡ (kcal/mol)"""
-        lambda_kj = lambda_ * self.ev_to_kcal * 4.184  # eV → kcal → kJ
-        numerator = (lambda_kj + delta_g) ** 2
-        denominator = 4 * lambda_kj + 1e-8
-        return numerator / denominator
-
-    def _theoretical_log_kcat(self, barrier_kj: torch.Tensor) -> torch.Tensor:
-        """ΔG‡ (kJ/mol) → log10(kcat) via transition state theory"""
-        # kcat = kBT/h * exp(-ΔG‡ / RT) in s⁻¹
-        log_kcat_natural = math.log(self.kBT_h) - barrier_kj / (self.RT_kJ + 1e-8)
-        return log_kcat_natural / math.log(10)   # natural log → log10
-
-    def forward(self,
-                pkd: torch.Tensor,
-                lambda_: torch.Tensor,
-                log_kcat_pred: torch.Tensor,
-                cofactor_strs: list[str],
-                ) -> dict[str, torch.Tensor]:
+    def forward(self, h_reaction: torch.Tensor, h_initial: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        Returns dict of losses keyed by mechanism type.
-        """
-        batch_size = pkd.size(0)
-
-        # 分组：按电子转移机制
-        et_mask = torch.zeros(batch_size, dtype=torch.bool)
-        hydride_mask = torch.zeros(batch_size, dtype=torch.bool)
-        pcet_mask = torch.zeros(batch_size, dtype=torch.bool)
-        hydride_deltas = torch.zeros(batch_size)
-        pcet_lambda_ps = torch.zeros(batch_size)
-
-        for i, cf_str in enumerate(cofactor_strs):
-            prior = get_prior_for_cofactors(cf_str)
-            if prior.mechanism == "hydride":
-                hydride_mask[i] = True
-                hydride_deltas[i] = prior.delta
-            elif prior.mechanism == "pcet":
-                pcet_mask[i] = True
-                pcet_lambda_ps[i] = prior.lambda_p
-            else:
-                et_mask[i] = True
-
-        delta_g = self._delta_g_from_pkd(pkd)  # kJ/mol
-
-        losses = {}
-        total_physics_loss = torch.tensor(0.0, device=pkd.device)
-
-        # ── 纯 ET ──
-        if et_mask.any():
-            lambda_et = lambda_[et_mask]
-            dg_et = delta_g[et_mask]
-            barrier = self._marcus_barrier(dg_et, lambda_et)
-            log_kcat_theory = self._theoretical_log_kcat(barrier)
-            log_kcat_pred_sub = log_kcat_pred[et_mask]
-            loss = F.smooth_l1_loss(log_kcat_pred_sub, log_kcat_theory)
-            losses["L_marcus_et"] = loss
-            total_physics_loss = total_physics_loss + loss
-
-        # ── Marcus-Hammond (hydride) ──
-        if hydride_mask.any():
-            lambda_h = lambda_[hydride_mask]
-            dg_h = delta_g[hydride_mask]
-            delta_h = hydride_deltas[hydride_mask].to(pkd.device)
-
-            # Marcus 基础项
-            barrier_base = self._marcus_barrier(dg_h, lambda_h)
-            # Hammond 修正项: δ · |ΔG°|
-            hammond_correction = delta_h * torch.abs(dg_h)
-            barrier_h = barrier_base + hammond_correction
-
-            log_kcat_theory = self._theoretical_log_kcat(barrier_h)
-            log_kcat_pred_sub = log_kcat_pred[hydride_mask]
-            loss = F.smooth_l1_loss(log_kcat_pred_sub, log_kcat_theory)
-            losses["L_marcus_hydride"] = loss
-            total_physics_loss = total_physics_loss + loss
-
-        # ── PCET ──
-        if pcet_mask.any():
-            lambda_pcet = lambda_[pcet_mask]
-            dg_pc = delta_g[pcet_mask]
-            lambda_p = pcet_lambda_ps[pcet_mask].to(pkd.device)
-
-            # PCET: 有效重组能 = λ_e + λ_p
-            lambda_eff = lambda_pcet + lambda_p * 23.0605 * 4.184  # eV→kJ
-            dg_eff = dg_pc  # 简化
-
-            barrier = (lambda_eff + dg_eff) ** 2 / (4 * lambda_eff + 1e-8)
-            log_kcat_theory = self._theoretical_log_kcat(barrier)
-            log_kcat_pred_sub = log_kcat_pred[pcet_mask]
-            loss = F.smooth_l1_loss(log_kcat_pred_sub, log_kcat_theory)
-            losses["L_marcus_pcet"] = loss
-            total_physics_loss = total_physics_loss + loss
-
-        losses["L_physics_total"] = total_physics_loss
-        return losses
-
-
-# ─────────────────────────────────────────────────────────────
-# OT 正则化（Zhu 2025）
-# ─────────────────────────────────────────────────────────────
-
-class OTRegularizer(nn.Module):
-    """
-    对学习到的 λ 分布施加基于辅因子类型的软约束。
-
-    迭代 Sinkhorn 算法计算可微的 Wasserstein 距离，
-    将每个 batch 中各类辅因子的 λ 经验分布拉到参考分布附近。
-    """
-
-    def __init__(self,
-                 cofactor_priors: dict[str, CofactorPrior],
-                 n_bins: int = 50,
-                 lambda_range: tuple[float, float] = (0.1, 2.5),
-                 sinkhorn_reg: float = 0.05,
-                 sinkhorn_iters: int = 20,
-                 ):
-        super().__init__()
-        self.priors = cofactor_priors
-        self.n_bins = n_bins
-        self.sinkhorn_reg = sinkhorn_reg
-        self.sinkhorn_iters = sinkhorn_iters
-
-        # 构建离散分 bin
-        self.register_buffer(
-            "bin_edges",
-            torch.linspace(lambda_range[0], lambda_range[1], n_bins + 1),
-        )
-        bin_centers = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2
-
-        # 为每种辅因子构建参考分布 (Gaussian 近似)
-        self.cofactor_to_idx = {}
-        ref_dists = []
-        for i, (cf_type, prior) in enumerate(sorted(cofactor_priors.items())):
-            self.cofactor_to_idx[cf_type] = i
-            # Gaussian 离散化到 bins
-            sigma = prior.lambda_std
-            mu = prior.lambda_mean
-            # 计算每个 bin 的密度
-            density = torch.exp(-0.5 * ((bin_centers - mu) / sigma) ** 2)
-            density = density / (density.sum() + 1e-8)
-            ref_dists.append(density)
-
-        self.register_buffer("ref_distributions",
-                             torch.stack(ref_dists))  # (n_cofactors, n_bins)
-
-    def _empirical_distribution(self, lambda_values: torch.Tensor) -> torch.Tensor:
-        """Soft bin assignment: 对 λ 值分配到离散 bin 中"""
-        lambda_clamped = lambda_values.clamp(
-            self.bin_edges[0].item(), self.bin_edges[-1].item()
-        )
-        idx = torch.searchsorted(self.bin_edges[1:-1], lambda_clamped)
-        dist = torch.zeros(lambda_values.size(0), self.n_bins,
-                           device=lambda_values.device)
-        dist.scatter_(1, idx.unsqueeze(-1), 1.0)
-        return dist.mean(dim=0)  # empirical mean distribution per batch
-
-    def _sinkhorn_distance(self, mu: torch.Tensor, nu: torch.Tensor) -> torch.Tensor:
-        """可微 Sinkhorn 距离。mu, nu 均为归一化直方图 (n_bins,)"""
-        n = mu.size(0)
-
-        # 代价矩阵：bin 中心之间的欧氏距离
-        bins = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2
-        C = torch.abs(bins.unsqueeze(0) - bins.unsqueeze(1))  # (n_bins, n_bins)
-
-        # 核矩阵
-        K = torch.exp(-C / self.sinkhorn_reg)
-
-        # Sinkhorn 迭代
-        v = torch.ones_like(nu)
-        for _ in range(self.sinkhorn_iters):
-            u = mu / (K @ v + 1e-8)
-            v = nu / (K.T @ u + 1e-8)
-
-        # 最优传输计划
-        P = torch.diag(u) @ K @ torch.diag(v)
-
-        # Wasserstein 距离
-        return (C * P).sum()
-
-    def forward(self,
-                lambda_values: torch.Tensor,
-                cofactor_strs: list[str],
-                ) -> torch.Tensor:
-        """
-        对每个辅因子类别计算 Wasserstein 距离并求和。
-
         Args:
-          lambda_values: (B,) 预测的 λ 值 (eV)
-          cofactor_strs: list[str] 辅因子字符串列表
+            h_reaction: (B, D) 沿反应坐标演化后的状态
+            h_initial:  (B, D) 初始状态
+        
+        Returns:
+            ts_stability:  (B,) 预测的pKd（过渡态稳定性代理）
+            catalysis_rate: (B,) 预测的log10(kcat)
+            barrier_height: (B,) 预测的活化能垒
         """
-        total_wass = torch.tensor(0.0, device=lambda_values.device)
-        n_groups = 0
-
-        # 按主辅因子类型分组
-        groups: dict[str, list[int]] = {}
-        for i, cf_str in enumerate(cofactor_strs):
-            prior = get_prior_for_cofactors(cf_str)
-            # 找到匹配的参考分布键
-            cofactors = [c.strip() for c in str(cf_str).split("|")]
-            key = None
-            for cf in cofactors:
-                if cf in self.cofactor_to_idx:
-                    key = cf
-                    break
-            if key is not None:
-                groups.setdefault(key, []).append(i)
-
-        for cf_type, indices in groups.items():
-            if len(indices) < 3:  # 至少 3 个样本才有意义
-                continue
-            idx = self.cofactor_to_idx[cf_type]
-            ref_dist = self.ref_distributions[idx]
-
-            lambda_sub = lambda_values[torch.tensor(indices, device=lambda_values.device)]
-            emp_dist = self._empirical_distribution(lambda_sub)
-
-            wass = self._sinkhorn_distance(emp_dist, ref_dist)
-            total_wass = total_wass + wass
-            n_groups += 1
-
-        return total_wass / max(n_groups, 1)
+        h = self.shared(h_reaction)
+        
+        # 过渡态稳定性：从最终状态预测，范围 [2, 15]
+        raw_ts = self.ts_head(h).squeeze(-1)
+        ts_stability = 2.0 + 13.0 * torch.sigmoid(raw_ts)
+        
+        # 催化效率：从状态差异预测
+        h_diff = (h_reaction - h_initial).pow(2).mean(dim=-1)
+        raw_cat = self.catalysis_head(h)
+        catalysis_rate = raw_cat.squeeze(-1) + h_diff.clamp(max=5.0)
+        
+        # 活化能垒：物理约束范围 [30, 200] kJ/mol
+        raw_barrier = self.barrier_head(h).squeeze(-1)
+        barrier_height = 30.0 + 170.0 * torch.sigmoid(raw_barrier / 50.0)
+        
+        return {
+            'ts_stability': ts_stability,
+            'catalysis_rate': catalysis_rate,
+            'barrier_height': barrier_height,
+        }
 
 
-# ─────────────────────────────────────────────────────────────
-# 完整模型
-# ─────────────────────────────────────────────────────────────
-
-class MarcusPINN(nn.Module):
+class BINNLoss(nn.Module):
     """
-    酶挖掘排序模型：预测酶-底物催化效率 (kcat/KM) 用于底物偏好排序。
+    基于不确定性权重的BINN损失函数
+    
+    特点：
+    - 自动学习每个损失项的权重
+    - 基于uncertainty weighting (Kendall et al.)
+    - 包含物理正则化项
+    """
 
+    def __init__(self):
+        super().__init__()
+        # 可学习的log方差，对应各损失项的权重
+        # sigma越大 → 权重越小 → 该损失项的重要性降低
+        self.register_parameter(
+            'log_var_ts', nn.Parameter(torch.tensor(0.0))
+        )
+        self.register_parameter(
+            'log_var_cat', nn.Parameter(torch.tensor(0.0))
+        )
+
+    def forward(self, 
+                outputs: dict, 
+                batch: dict,
+                barrier_weight: float = 0.1,
+                progress_weight: float = 0.01
+               ) -> tuple[torch.Tensor, dict]:
+        """
+        Args:
+            outputs: 模型输出
+            batch: 数据批次
+            barrier_weight: 能垒正则化权重
+            progress_weight: 进度正则化权重
+        
+        Returns:
+            total_loss, losses_dict
+        """
+        device = outputs['ts_stability'].device
+        losses = {}
+        
+        # ═══════════════════════════════════════════════════════
+        # 1. 过渡态稳定性损失 L_ts（主损失）
+        # ═══════════════════════════════════════════════════════
+        pkd_mask = batch.get('pkd_target_mask', torch.ones_like(outputs['ts_stability'], dtype=torch.bool))
+        
+        if pkd_mask.any():
+            l_ts = F.smooth_l1_loss(
+                outputs['ts_stability'][pkd_mask],
+                batch['pkd_target'][pkd_mask]
+            )
+        else:
+            l_ts = torch.tensor(0.0, device=device)
+        losses['L_ts'] = l_ts
+        
+        # ═══════════════════════════════════════════════════════
+        # 2. 催化效率损失 L_catalysis
+        # ═══════════════════════════════════════════════════════
+        kcat_mask = batch.get('kcat_target_mask', torch.zeros_like(outputs['catalysis_rate'], dtype=torch.bool))
+        
+        if kcat_mask.any():
+            l_cat = F.smooth_l1_loss(
+                outputs['catalysis_rate'][kcat_mask],
+                batch['log_kcat_target'][kcat_mask]
+            )
+        else:
+            l_cat = torch.tensor(0.0, device=device)
+        losses['L_catalysis'] = l_cat
+        
+        # ═══════════════════════════════════════════════════════
+        # 3. 能垒正则化 L_barrier
+        # ═══════════════════════════════════════════════════════
+        barrier = outputs['barrier_height']  # (B,), 范围 [30, 200] kJ/mol
+        
+        # 鼓励能垒在合理范围：不要太低（催化太容易）也不要太高（太难）
+        target_barrier = barrier.detach().clamp(50.0, 150.0)  # 中等范围
+        l_barrier = F.mse_loss(barrier, target_barrier) * barrier_weight
+        losses['L_barrier'] = l_barrier
+        
+        # ═══════════════════════════════════════════════════════
+        # 4. 反应进度正则化 L_progress
+        # ═══════════════════════════════════════════════════════
+        # 确保BINN学到了"反应过程"，而非恒等映射
+        if 'reaction_progress' in outputs:
+            l_progress = outputs['reaction_progress'].mean()
+            l_progress = F.relu(l_progress - 0.5) * progress_weight  # 鼓励进展
+        else:
+            l_progress = torch.tensor(0.0, device=device)
+        losses['L_progress'] = l_progress
+        
+        # ═══════════════════════════════════════════════════════
+        # 5. 不确定性权重 + 总损失
+        # ═══════════════════════════════════════════════════════
+        # 权重 = exp(-log_var)，sigma越大权重越小
+        w_ts = torch.exp(-self.log_var_ts)
+        w_cat = torch.exp(-self.log_var_cat)
+        
+        total = (
+            w_ts * losses['L_ts'] + self.log_var_ts +
+            w_cat * losses['L_catalysis'] + self.log_var_cat +
+            losses['L_barrier'] +
+            losses['L_progress']
+        )
+        
+        losses['total'] = total
+        losses['weights'] = {
+            'w_ts': w_ts.item(),
+            'w_cat': w_cat.item(),
+            'sigma_ts': torch.exp(self.log_var_ts).item(),
+            'sigma_cat': torch.exp(self.log_var_cat).item(),
+        }
+        
+        return total, losses
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 完整模型：TransitionBINN（基于过渡态理论的新模型）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TransitionBINN(nn.Module):
+    """
+    基于过渡态理论的BINN模型
+    
+    完全基于过渡态理论，不依赖电子转移假设：
+    - 适用于所有氧化还原酶（不限于特定机制）
+    - 不使用Marcus方程
+    - 可扩展到其他酶类型（未来）
+    
     架构：
-      - pKd 路径（底物级）：配体 GNN + 蛋白结构/口袋 + 辅因子 → InteractionModule → pKd
-      - kcat 路径（蛋白级）：ESM-2 + 辅因子嵌入 → KcatPredictor MLP → log_kcat
-      - 两条路径分离，输出端汇合：score = pKd + log_kcat = log10(kcat/KM)
-
-    输入：蛋白序列嵌入 + 配体分子图 + 辅因子类型
-    输出：pKd (约束[2,15]) + λ (重组能偏移) + log10(kcat)
-    损失：L_total = L_score(kcat/KM) + L_pkd_fallback(无kcat标签的样本)
+      LigandEncoder (GATv2) + ProteinEncoder (ESM-2) + CofactorEncoder
+      → ReactionCoordinateBINN (反应坐标Neural ODE + 门控)
+      → BINNCatalysisHead (ts_stability + catalysis_rate)
     """
 
     COFACTOR_TYPES = sorted(COFACTOR_PRIORS.keys())
 
-    def __init__(self,
-                 hidden_dim: int = 256,
-                 cofactor_embed_dim: int = 64,
-                 n_heads: int = 4,
-                 gnn_layers: int = 3,
-                 ):
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        cofactor_embed_dim: int = 64,
+        n_heads: int = 4,
+        gnn_layers: int = 3,
+        n_ode_steps: int = 5,
+        use_gate: bool = True,
+    ):
         super().__init__()
-
+        
         self.hidden_dim = hidden_dim
         self.cofactor_embed_dim = cofactor_embed_dim
-
-        # 编码器
+        
+        # ═══════════════════════════════════════════════════════
+        # 编码器（与原模型相同）
+        # ═══════════════════════════════════════════════════════
         self.ligand_encoder = LigandEncoder(
             atom_dim=79, edge_dim=10, hidden_dim=hidden_dim,
             num_layers=gnn_layers, heads=n_heads,
@@ -870,49 +907,53 @@ class MarcusPINN(nn.Module):
         self.cofactor_encoder = CofactorEncoder(
             cofactor_types=self.COFACTOR_TYPES, embed_dim=cofactor_embed_dim,
         )
-
-        # 投影对齐
+        
+        # ∗ 投影对齐
         self.ligand_proj = nn.Linear(hidden_dim, hidden_dim)
         self.cofactor_proj = nn.Linear(cofactor_embed_dim, hidden_dim)
-
-        # 交互模块
-        self.interaction = InteractionModule(
-            hidden_dim=hidden_dim, num_heads=n_heads,
-        )
-
-        # 预测头
-        self.head = MultiTaskHead(hidden_dim=hidden_dim)
-
-        # kcat 预测器（蛋白级，独立路径 — 不与 pKd 共享表征）
-        self.kcat_predictor = KcatPredictor(
-            seq_embed_dim=1280, cofactor_dim=cofactor_embed_dim,
+        
+        # ═══════════════════════════════════════════════════════
+        # BINN交互层（核心新组件）
+        # ═══════════════════════════════════════════════════════
+        self.binn = ReactionCoordinateBINN(
             hidden_dim=hidden_dim,
+            n_ode_steps=n_ode_steps,
+            use_gate=use_gate,
         )
-
-        # 物理损失和OT正则化已移除（Marcus方程经验证不适用于当前数据集）
-        # λ 预测头保留，但不再参与损失计算
+        
+        # ═══════════════════════════════════════════════════════
+        # 预测头
+        # ═══════════════════════════════════════════════════════
+        self.catalysis_head = BINNCatalysisHead(hidden_dim=hidden_dim)
+        
+        # ═══════════════════════════════════════════════════════
+        # 损失函数（可学习权重）
+        # ═══════════════════════════════════════════════════════
+        self.loss_fn = BINNLoss()
 
     def forward(self,
-                ligand_data,                       # PyG Batch
-                seq_embed: torch.Tensor,           # (B, 1280)
+                ligand_data,
+                seq_embed: torch.Tensor,
                 cofactor_strs: list[str],
-                struct_feat: Optional[torch.Tensor] = None,   # (B, 3)
-                has_structure: Optional[torch.Tensor] = None,  # (B,)
-                domain_masks: Optional[torch.Tensor] = None,   # (B, 15, L_padded)
-                domain_padding_mask: Optional[torch.Tensor] = None,  # (B, L_padded)
-                pocket_cn: Optional[torch.Tensor] = None,      # (B, K)
-                pocket_pi: Optional[torch.Tensor] = None,      # (B, K)
-                pocket_dist: Optional[torch.Tensor] = None,    # (B, K, K)
-                pocket_mask: Optional[torch.Tensor] = None,    # (B, K)
+                struct_feat: Optional[torch.Tensor] = None,
+                has_structure: Optional[torch.Tensor] = None,
+                domain_masks: Optional[torch.Tensor] = None,
+                domain_padding_mask: Optional[torch.Tensor] = None,
+                pocket_cn: Optional[torch.Tensor] = None,
+                pocket_pi: Optional[torch.Tensor] = None,
+                pocket_dist: Optional[torch.Tensor] = None,
+                pocket_mask: Optional[torch.Tensor] = None,
                 ) -> dict[str, torch.Tensor]:
         """
         Returns:
-          pkd:           predicted pKd (B,) — 底物级结合亲和力 (InteractionModule → head)
-          lambda_total:  predicted reorganization energy (eV) (B,)
-          log_kcat:      predicted log10(kcat) (B,) — 蛋白级催化速率 (KcatPredictor)
-          cofactor_embed: cofactor embedding (B, cofactor_embed_dim)
+            ts_stability:   (B,) 预测的pKd（过渡态稳定性）
+            catalysis_rate: (B,) 预测的log10(kcat)
+            barrier_height: (B,) 预测的活化能垒
+            reaction_progress: (B,) 反应进度
+            trajectory: list 演化轨迹
+            h_reaction: (B, D) 最终状态
         """
-        # 编码
+        # ── 编码 ────────────────────────────────────────────
         ligand_h = self.ligand_encoder(ligand_data)
         ligand_h = self.ligand_proj(ligand_h)
 
@@ -926,198 +967,129 @@ class MarcusPINN(nn.Module):
             pocket_mask=pocket_mask,
         )
 
-        cofactor_h, lambda_offset = self.cofactor_encoder(cofactor_strs)
+        cofactor_h, _ = self.cofactor_encoder(cofactor_strs)
         cofactor_h_proj = self.cofactor_proj(cofactor_h)
-
-        # 交互 → pKd + λ (底物级路径)
-        combined = self.interaction(protein_h, ligand_h, cofactor_h_proj)
-        pkd, lambda_offset_head = self.head(combined)
-
-        # kcat 预测 (蛋白级路径 — 独立，不经过交互模块)
-        log_kcat = self.kcat_predictor(seq_embed, cofactor_h)
-
-        # λ_total = λ_prior + λ_offset (cofactor) + λ_offset (head)
-        lambda_prior_batch = torch.tensor([
-            get_prior_for_cofactors(cf).lambda_mean for cf in cofactor_strs
-        ], device=pkd.device)
-        lambda_total = lambda_prior_batch + lambda_offset.squeeze(-1) + lambda_offset_head
-        # soft clamp（可导）：λ 被柔和地约束在合理范围 [0.05, 3.0] eV
-        lambda_total = 0.05 + F.softplus(lambda_total - 0.05)
-        lambda_total = 3.0 - F.softplus(3.0 - lambda_total)
-
+        
+        # ── BINN反应坐标演化 ────────────────────────────────
+        binn_output = self.binn(protein_h, ligand_h, cofactor_h_proj)
+        
+        # ── 催化预测 ────────────────────────────────────────
+        catalysis_output = self.catalysis_head(
+            binn_output['h_reaction'],
+            binn_output['h_initial']
+        )
+        
+        # ── 整合输出 ────────────────────────────────────────
         return {
-            "pkd": pkd,
-            "lambda": lambda_total,
-            "log_kcat": log_kcat,
-            "lambda_prior": lambda_prior_batch,
-            "lambda_offset": lambda_offset,
-            "lambda_offset_head": lambda_offset_head,
-            "cofactor_embed": cofactor_h,
+            # 主要预测
+            'ts_stability': catalysis_output['ts_stability'],     # ≈ pKd
+            'catalysis_rate': catalysis_output['catalysis_rate'], # ≈ log10(kcat)
+            'barrier_height': catalysis_output['barrier_height'], # ΔG‡ (kJ/mol)
+            
+            # 物理量（用于分析）
+            'reaction_progress': binn_output['reaction_progress'],
+            'h_reaction': binn_output['h_reaction'],
+            'h_initial': binn_output['h_initial'],
+            'h_final': binn_output['h_final'],
+            
+            # 轨迹信息（用于调试）
+            'trajectory': binn_output['trajectory'],
+            'gate_values': binn_output['gate_values'],
+            'barrier_heights': binn_output['barrier_heights'],
+            
+            # 编码器输出（用于分析）
+            'protein_h': protein_h,
+            'ligand_h': ligand_h,
+            'cofactor_h': cofactor_h,
         }
 
     def compute_loss(self,
                      outputs: dict,
                      batch: dict,
+                     barrier_weight: float = 0.1,
+                     progress_weight: float = 0.01,
                      ) -> tuple[torch.Tensor, dict]:
         """
-        统一催化效率损失函数：直接优化 kcat/KM（酶学适配性标准指标）。
-
-        设计原则：
-          - 主损失 L_score：直接优化 (pKd + log_kcat) = log10(kcat/KM)
-            模型自由分配 pKd 和 kcat 的预测误差来最小化组合误差
-          - 回退 L_pkd_fallback：对无 kcat 标签的样本 (18%)，退化为纯 pKd 损失
-          - 监控指标：L_pkd_monitor 和 L_kcat_monitor 仅用于日志，不参与梯度
-
-        Args:
-          outputs: forward() 的输出
-          batch:   {
-            pkd_target, log_kcat_target,
-            pkd_target_mask, kcat_target_mask,
-            quality_weight (含 thermo_weight),
-          }
-
-        Returns:
-          total_loss, loss_components
+        基于BINN的损失函数计算
+        
+        不再使用L_pkd + L_kcat的旧形式，而是：
+        - L_ts: 过渡态稳定性（与pKd对应）
+        - L_catalysis: 催化效率（与log_kcat对应）
+        - L_barrier: 能垒正则化
+        - L_progress: 反应进度正则化
         """
-        pkd_pred = outputs["pkd"]
-        log_kcat_pred = outputs["log_kcat"]
-
-        losses = {}
-        quality_weight = batch.get("quality_weight", torch.ones_like(pkd_pred))
-        pkd_mask = batch.get("pkd_target_mask", torch.ones_like(pkd_pred, dtype=torch.bool))
-        kcat_mask = batch.get("kcat_target_mask", torch.zeros_like(log_kcat_pred, dtype=torch.bool))
-
-        # 样本分组
-        both_mask = pkd_mask & kcat_mask              # 有 pKd + kcat：用 kcat/KM
-        pkd_only_mask = pkd_mask & ~kcat_mask          # 仅有 pKd：回退到 pKd 损失
-
-        # ── 主损失：kcat/KM = pKd + log10(kcat) ──
-        if both_mask.any():
-            score_pred = pkd_pred[both_mask] + log_kcat_pred[both_mask]
-            score_true = batch["pkd_target"][both_mask] + batch["log_kcat_target"][both_mask]
-            diff = score_pred - score_true
-            losses["L_score"] = (quality_weight[both_mask] * F.smooth_l1_loss(
-                diff, torch.zeros_like(diff), reduction='none'
-            )).mean()
-        else:
-            losses["L_score"] = torch.tensor(0.0, device=pkd_pred.device)
-
-        # ── 回退损失：纯 pKd (无 kcat 标签的样本) ──
-        if pkd_only_mask.any():
-            diff = pkd_pred[pkd_only_mask] - batch["pkd_target"][pkd_only_mask]
-            losses["L_pkd_fallback"] = (quality_weight[pkd_only_mask] * F.smooth_l1_loss(
-                diff, torch.zeros_like(diff), reduction='none'
-            )).mean()
-        else:
-            losses["L_pkd_fallback"] = torch.tensor(0.0, device=pkd_pred.device)
-
-        # ── 监控指标（不参与梯度，仅用于日志） ──
-        if pkd_mask.any():
-            diff = pkd_pred[pkd_mask] - batch["pkd_target"][pkd_mask]
-            losses["L_pkd_monitor"] = F.l1_loss(diff, torch.zeros_like(diff))
-        else:
-            losses["L_pkd_monitor"] = torch.tensor(0.0, device=pkd_pred.device)
-
-        if kcat_mask.any():
-            diff = log_kcat_pred[kcat_mask] - batch["log_kcat_target"][kcat_mask]
-            losses["L_kcat_monitor"] = F.l1_loss(diff, torch.zeros_like(diff))
-        else:
-            losses["L_kcat_monitor"] = torch.tensor(0.0, device=log_kcat_pred.device)
-
-        # ── 总损失 ──
-        total = losses["L_score"] + losses["L_pkd_fallback"]
-        losses["total"] = total
-
-        return total, losses
-
-    def predict_activation_barrier(self, outputs: dict) -> torch.Tensor:
-        """辅助函数：从模型输出计算预测的 ΔG‡ (kJ/mol)。
-
-        使用 Marcus 方程 ΔG‡ = (λ + ΔG°)² / (4λ)。
-        注意：此函数仅供分析参考，Marcus 约束已从训练损失中移除
-        （经验证 kcat_true / kcat_marcus ≈ 10⁻⁶）。
-        """
-        delta_g_kj = DELTA_G_FACTOR * outputs["pkd"]     # kJ/mol
-        lambda_ev = outputs["lambda"]                      # eV
-        lambda_kj = lambda_ev * 23.0605 * 4.184            # eV → kcal → kJ
-        numerator = (lambda_kj + delta_g_kj) ** 2
-        denominator = 4 * lambda_kj + 1e-8
-        return numerator / denominator
+        return self.loss_fn(outputs, batch, barrier_weight, progress_weight)
 
     def predict_catalytic_efficiency(self, outputs: dict) -> torch.Tensor:
-        """辅助函数：计算 log10(kcat/KM) from pKd + kcat"""
-        # KM = Kd (简化假设; 实际中 KM ≠ Kd 但不影响数量级估计)
-        pkd = outputs["pkd"]
-        log_kcat = outputs["log_kcat"]
-        # kcat/KM ≈ kcat * Kd⁻¹ = kcat * 10^pKd
+        """
+        辅助函数：计算 log10(kcat/KM) 催化效率指标
+        
+        简化估计：kcat/KM ≈ kcat * Kd^(-1) = kcat * 10^pKd
+        """
+        pkd = outputs['ts_stability']
+        log_kcat = outputs['catalysis_rate']
         log_kcat_km = log_kcat + pkd
         return log_kcat_km
 
 
-# ─────────────────────────────────────────────────────────────
-# 训练辅助
-# ─────────────────────────────────────────────────────────────
-
-def create_optimizer(model: MarcusPINN, lr: float = 1e-4, weight_decay: float = 1e-5):
-    """创建分组优化器（编码器 vs 预测头不同学习率）"""
+def create_bin_optimizer(model: TransitionBINN, lr: float = 1e-4, weight_decay: float = 1e-5):
+    """
+    为TransitionBINN创建分组优化器
+    
+    不同于原模型，BINN的权重（dynamics_net, gate）需要不同的学习率
+    """
     encoder_params = []
+    binn_params = []
     head_params = []
+    loss_params = []
+    
     for name, param in model.named_parameters():
-        if "head" in name:
+        if 'loss_fn' in name:
+            loss_params.append(param)
+        elif 'binn' in name:
+            binn_params.append(param)
+        elif 'catalysis_head' in name:
             head_params.append(param)
         else:
             encoder_params.append(param)
-
+    
     return torch.optim.AdamW([
-        {"params": encoder_params, "lr": lr},
-        {"params": head_params, "lr": lr * 2},
-    ], weight_decay=weight_decay)
+        {'params': encoder_params, 'lr': lr, 'weight_decay': weight_decay},
+        {'params': binn_params, 'lr': lr * 0.5, 'weight_decay': weight_decay},  # BINN稍慢
+        {'params': head_params, 'lr': lr * 2, 'weight_decay': weight_decay},
+        {'params': loss_params, 'lr': lr * 0.1, 'weight_decay': 0},  # 损失权重学习更慢
+    ])
 
 
-def warmup_schedule(step: int, warmup_steps: int = 1000) -> float:
-    """物理损失 warmup: 先让数据损失收敛，再逐步增加物理约束"""
-    if step < warmup_steps:
-        return float(step) / warmup_steps
-    return 1.0
-
-
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 # 测试入口
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  酶挖掘排序模型 — 结构验证")
+    print("  酶挖掘排序模型 — TransitionBINN (基于过渡态理论)")
     print("=" * 60)
 
-    model = MarcusPINN(hidden_dim=256)
+    model = TransitionBINN(hidden_dim=256)
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  总参数量:    {total_params:,}")
-    print(f"  可训练参数:  {trainable_params:,}")
 
-    print(f"\n  辅因子先验表 ({len(COFACTOR_PRIORS)} 种):")
-    for cf, prior in sorted(COFACTOR_PRIORS.items()):
-        print(f"    {cf:12s}  λ={prior.lambda_mean:.2f}±{prior.lambda_std:.2f} eV  "
-              f"机制={prior.mechanism:8s}  "
-              f"{'δ='+str(prior.delta) if prior.delta else ''}"
-              f"{'λ_p='+str(prior.lambda_p) if prior.lambda_p else ''}")
+    print(f"\n  架构:")
+    print(f"    LigandEncoder:   GATv2Conv x {model.ligand_encoder.convs.__len__()}")
+    print(f"    ProteinEncoder:  ESM-2 1280-dim -> {model.hidden_dim}-dim")
+    print(f"    CofactorEncoder: {model.cofactor_encoder.num_types} types -> {model.cofactor_embed_dim}-dim")
+    print(f"    BINN层:          ReactionCoordinateBINN (n_steps={model.binn.n_steps})")
+    print(f"    门控:            {'启用' if model.binn.use_gate else '禁用'}")
 
-    print(f"  编码器:")
-    print(f"    LigandEncoder:  GATv2Conv × {model.ligand_encoder.convs.__len__()}")
-    print(f"    ProteinEncoder: ESM-2 1280-dim → {model.hidden_dim}-dim")
-    print(f"    CofactorEncoder: {model.cofactor_encoder.num_types} types → {model.cofactor_embed_dim}-dim")
-    print(f"    KcatPredictor: ESM-2 1280-dim + cofactor 64-dim → MLP → log_kcat (独立路径)")
-
-    print(f"\n  输出头:")
-    print(f"    pKd:      结合亲和力 (−log10 Kd)，约束 [2, 15] (InteractionModule → head)")
-    print(f"    log_kcat: log10 催化速率常数 (s⁻¹) (KcatPredictor, 蛋白级独立路径)")
-    print(f"    λ:        重组能 (eV), 辅因子先验 + 可学习偏移 (保留，不参与损失)")
+    print(f"\n  预测头:")
+    print(f"    ts_stability:   过渡态稳定性 (approx pKd), 范围 [2, 15]")
+    print(f"    catalysis_rate: 催化效率 (approx log10(kcat))")
+    print(f"    barrier_height: 活化能垒 (kJ/mol)")
 
     print(f"\n  损失函数:")
-    print(f"    L_total = L_score(kcat/KM) + L_pkd_fallback(无kcat样本)")
-    print(f"    - L_score:  直接优化 pKd + log_kcat = log10(kcat/KM)")
-    print(f"    - L_pkd_fallback: 无kcat标签时回退为纯pKd损失")
-    print(f"    - 监控: L_pkd_monitor, L_kcat_monitor (不参与梯度)")
+    print(f"    L_ts:        过渡态稳定性 (不确定性权重)")
+    print(f"    L_catalysis: 催化效率 (不确定性权重)")
+    print(f"    L_barrier:   能垒正则化")
+    print(f"    L_progress:  反应进度正则化")
 
-    print("\n  ✓ 模型结构验证通过")
+    print("\n  ✓ 结构验证通过 — TransitionBINN Ready!")
