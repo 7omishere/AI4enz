@@ -13,6 +13,7 @@ venv/
 dataset_building/data/
 dataset_building/processed/
 dataset_building/external_data/
+dataset_building/release/
 
 # Checkpoints
 dataset_building/checkpoints/*

@@ -93,6 +93,29 @@ THERMO_WEIGHT = {
     'IC50': 0.15,   # 非热力学量，经ChEMBL校正后仍有系统误差
 }
 
+# ─────────────────────────────────────────────────────────────
+# Min-Max 归一化参数（基于数据集统计）
+# 用于平衡 pKd 和 log_kcat 的损失量级
+# ─────────────────────────────────────────────────────────────
+NORM_PARAMS = {
+    # pKd: 范围 [0, 14] → [0, 1]
+    'pkd_min': 0.0,
+    'pkd_max': 14.0,
+    # log10(kcat): 范围 [-6, 7] → [0, 1]
+    'kcat_min': -6.0,
+    'kcat_max': 7.0,
+}
+
+
+def min_max_normalize(value, min_val, max_val):
+    """Min-Max 归一化到 [0, 1]"""
+    return (value - min_val) / (max_val - min_val)
+
+
+def min_max_denormalize(value, min_val, max_val):
+    """反归一化"""
+    return value * (max_val - min_val) + min_val
+
 
 def sequence_to_embedding(seq: str, max_len: int = 1020) -> torch.Tensor:
     """轻量级：氨基酸物化性质编码 → mean pooling"""
@@ -232,12 +255,20 @@ class OxidoreductaseDataset(Dataset):
         # ── 辅因子 ──
         cofactor_str = row.get("cofactors", "") or ""
 
-        # ── 标签 ──
+        # ── 标签（已归一化到 [0, 1]） ──
         pkd_val = row["pkd_aligned"] if pd.notna(row["pkd_aligned"]) else row["pkd_raw"]
         has_pkd = pd.notna(pkd_val)
 
         has_kcat = bool(row["has_kcat"])
         log_kcat_label = float(row["log_kcat_median"]) if has_kcat else 0.0
+
+        # ✅ Min-Max 归一化目标值（统一到 [0, 1] 范围）
+        pkd_normalized = min_max_normalize(
+            pkd_val, NORM_PARAMS['pkd_min'], NORM_PARAMS['pkd_max']
+        ) if has_pkd else 0.0
+        kcat_normalized = min_max_normalize(
+            log_kcat_label, NORM_PARAMS['kcat_min'], NORM_PARAMS['kcat_max']
+        ) if has_kcat else 0.0
 
         # kcat 来源权重（BRENDA=1.0, SABIO-RK=0.9, UniProt=0.7）
         kcat_source = str(row.get("kcat_source", ""))
@@ -261,9 +292,10 @@ class OxidoreductaseDataset(Dataset):
             "domain_masks": domain_masks,
             "has_structure": torch.tensor(has_structure, dtype=torch.bool),
             "cofactor_str": cofactor_str,
-            "pkd_target": torch.tensor(pkd_val if has_pkd else 0.0, dtype=torch.float32),
+            # ✅ 归一化后的目标值 [0, 1]，用于损失计算
+            "pkd_target": torch.tensor(pkd_normalized, dtype=torch.float32),
             "has_pkd": torch.tensor(has_pkd, dtype=torch.bool),
-            "log_kcat_target": torch.tensor(log_kcat_label, dtype=torch.float32),
+            "log_kcat_target": torch.tensor(kcat_normalized, dtype=torch.float32),
             "has_kcat": torch.tensor(has_kcat, dtype=torch.bool),
             "kcat_weight": torch.tensor(kcat_weight, dtype=torch.float32),
             "quality_weight": torch.tensor(quality_weight, dtype=torch.float32),
@@ -271,6 +303,9 @@ class OxidoreductaseDataset(Dataset):
             "pocket_pi": pocket_pi,
             "pocket_dist": pocket_dist,
             "pocket_mask": pocket_mask,
+            # 原始值（用于评估和反归一化）
+            "pkd_raw": torch.tensor(pkd_val if has_pkd else 0.0, dtype=torch.float32),
+            "log_kcat_raw": torch.tensor(log_kcat_label if has_kcat else 0.0, dtype=torch.float32),
         }
 
 

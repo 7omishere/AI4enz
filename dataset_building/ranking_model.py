@@ -567,13 +567,14 @@ class ReactionCoordinateBINN(nn.Module):
         
         # Step 2: ODE动力学函数
         #  learns: dh/dξ = f(h, catalyst_context, ligand)
+        #  注：使用GeLU替代SiLU，与ESM-2保持一致，梯度更流畅
         self.dynamics_net = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),  # h + catalyst + ligand
             nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
+            nn.GELU(),                               # ✅ GeLU: 更流畅的梯度
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),  # Tanh保证动力学稳定
+            nn.Tanh(),                               # 保留Tanh保证动力学稳定
         )
         
         # 残差缩放因子（让ODE更稳定）
@@ -686,7 +687,7 @@ class BINNCatalysisHead(nn.Module):
         self.shared = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
+            nn.GELU(),      # ✅ GeLU: 与ESM-2和动力学层一致
             nn.Dropout(0.1),
         )
         
@@ -717,24 +718,23 @@ class BINNCatalysisHead(nn.Module):
         Args:
             h_reaction: (B, D) 沿反应坐标演化后的状态
             h_initial:  (B, D) 初始状态
-        
+
         Returns:
-            ts_stability:  (B,) 预测的pKd（过渡态稳定性代理）
-            catalysis_rate: (B,) 预测的log10(kcat)
+            ts_stability:  (B,) 预测的pKd已归一化值 [0, 1]
+            catalysis_rate: (B,) 预测的log10(kcat)已归一化值 [0, 1]
             barrier_height: (B,) 预测的活化能垒
         """
         h = self.shared(h_reaction)
-        
-        # 过渡态稳定性：从最终状态预测，范围 [2, 15]
+
+        # 过渡态稳定性：预测归一化后的pKd (Min-Max: [0,14] → [0,1])
         raw_ts = self.ts_head(h).squeeze(-1)
-        ts_stability = 2.0 + 13.0 * torch.sigmoid(raw_ts)
-        
-        # 催化效率：从状态差异预测
-        h_diff = (h_reaction - h_initial).pow(2).mean(dim=-1)
-        raw_cat = self.catalysis_head(h)
-        catalysis_rate = raw_cat.squeeze(-1) + h_diff.clamp(max=5.0)
-        
-        # 活化能垒：物理约束范围 [30, 200] kJ/mol
+        ts_stability = torch.sigmoid(raw_ts)  # ✅ 直接输出 [0, 1]
+
+        # 催化效率：预测归一化后的log_kcat (Min-Max: [-6,7] → [0,1])
+        raw_cat = self.catalysis_head(h).squeeze(-1)
+        catalysis_rate = torch.sigmoid(raw_cat)  # ✅ 直接输出 [0, 1]
+
+        # 活化能垒（保持物理单位 kJ/mol，不归一化）
         raw_barrier = self.barrier_head(h).squeeze(-1)
         barrier_height = 30.0 + 170.0 * torch.sigmoid(raw_barrier / 50.0)
         
@@ -748,48 +748,46 @@ class BINNCatalysisHead(nn.Module):
 class BINNLoss(nn.Module):
     """
     基于不确定性权重的BINN损失函数
-    
+
     特点：
-    - 自动学习每个损失项的权重
-    - 基于uncertainty weighting (Kendall et al.)
+    - 自动学习每个损失项的权重（可选）
+    - 基于Uncertainty Weighting (Kendall et al.)
     - 包含物理正则化项
+    - 目标值已Min-Max归一化到[0,1]，损失量级自然一致
     """
 
-    def __init__(self):
+    def __init__(self, use_learnable_weights: bool = False):
+        """
+        Args:
+            use_learnable_weights: 是否使用可学习权重（建议初期False）
+        """
         super().__init__()
-        # 可学习的log方差，对应各损失项的权重
-        # sigma越大 → 权重越小 → 该损失项的重要性降低
-        self.register_parameter(
-            'log_var_ts', nn.Parameter(torch.tensor(0.0))
-        )
-        self.register_parameter(
-            'log_var_cat', nn.Parameter(torch.tensor(0.0))
-        )
+        self.use_learnable_weights = use_learnable_weights
+        if use_learnable_weights:
+            # 可学习的log方差，对应各损失项的权重
+            self.register_parameter(
+                'log_var_ts', nn.Parameter(torch.tensor(0.0))
+            )
+            self.register_parameter(
+                'log_var_cat', nn.Parameter(torch.tensor(0.0))
+            )
 
-    def forward(self, 
-                outputs: dict, 
+    def forward(self,
+                outputs: dict,
                 batch: dict,
                 barrier_weight: float = 0.1,
                 progress_weight: float = 0.01
-               ) -> tuple[torch.Tensor, dict]:
+                ) -> tuple[torch.Tensor, dict]:
         """
-        Args:
-            outputs: 模型输出
-            batch: 数据批次
-            barrier_weight: 能垒正则化权重
-            progress_weight: 进度正则化权重
-        
-        Returns:
-            total_loss, losses_dict
+        目标值已归一化，损失量级在[0,1]范围
+        简化方案：固定权重 1:1 或 learnable_weights=True
         """
         device = outputs['ts_stability'].device
         losses = {}
-        
-        # ═══════════════════════════════════════════════════════
-        # 1. 过渡态稳定性损失 L_ts（主损失）
-        # ═══════════════════════════════════════════════════════
+
+        # ── 1. 过渡态稳定性损失 L_ts ──────────────────────
         pkd_mask = batch.get('pkd_target_mask', torch.ones_like(outputs['ts_stability'], dtype=torch.bool))
-        
+
         if pkd_mask.any():
             l_ts = F.smooth_l1_loss(
                 outputs['ts_stability'][pkd_mask],
@@ -798,12 +796,10 @@ class BINNLoss(nn.Module):
         else:
             l_ts = torch.tensor(0.0, device=device)
         losses['L_ts'] = l_ts
-        
-        # ═══════════════════════════════════════════════════════
-        # 2. 催化效率损失 L_catalysis
-        # ═══════════════════════════════════════════════════════
+
+        # ── 2. 催化效率损失 L_catalysis ───────────────────
         kcat_mask = batch.get('kcat_target_mask', torch.zeros_like(outputs['catalysis_rate'], dtype=torch.bool))
-        
+
         if kcat_mask.any():
             l_cat = F.smooth_l1_loss(
                 outputs['catalysis_rate'][kcat_mask],
@@ -812,50 +808,47 @@ class BINNLoss(nn.Module):
         else:
             l_cat = torch.tensor(0.0, device=device)
         losses['L_catalysis'] = l_cat
-        
-        # ═══════════════════════════════════════════════════════
-        # 3. 能垒正则化 L_barrier
-        # ═══════════════════════════════════════════════════════
+
+        # ── 3. 能垒正则化 L_barrier ──────────────────────
         barrier = outputs['barrier_height']  # (B,), 范围 [30, 200] kJ/mol
-        
-        # 鼓励能垒在合理范围：不要太低（催化太容易）也不要太高（太难）
         target_barrier = barrier.detach().clamp(50.0, 150.0)  # 中等范围
         l_barrier = F.mse_loss(barrier, target_barrier) * barrier_weight
         losses['L_barrier'] = l_barrier
-        
-        # ═══════════════════════════════════════════════════════
-        # 4. 反应进度正则化 L_progress
-        # ═══════════════════════════════════════════════════════
-        # 确保BINN学到了"反应过程"，而非恒等映射
+
+        # ── 4. 反应进度正则化 L_progress ─────────────────
         if 'reaction_progress' in outputs:
             l_progress = outputs['reaction_progress'].mean()
-            l_progress = F.relu(l_progress - 0.5) * progress_weight  # 鼓励进展
+            l_progress = F.relu(l_progress - 0.5) * progress_weight
         else:
             l_progress = torch.tensor(0.0, device=device)
         losses['L_progress'] = l_progress
-        
-        # ═══════════════════════════════════════════════════════
-        # 5. 不确定性权重 + 总损失
-        # ═══════════════════════════════════════════════════════
-        # 权重 = exp(-log_var)，sigma越大权重越小
-        w_ts = torch.exp(-self.log_var_ts)
-        w_cat = torch.exp(-self.log_var_cat)
-        
-        total = (
-            w_ts * losses['L_ts'] + self.log_var_ts +
-            w_cat * losses['L_catalysis'] + self.log_var_cat +
-            losses['L_barrier'] +
-            losses['L_progress']
-        )
-        
+
+        # ── 5. 总损失计算 ────────────────────────────────
+        if self.use_learnable_weights and hasattr(self, 'log_var_ts'):
+            # 可学习权重
+            w_ts = torch.exp(-self.log_var_ts)
+            w_cat = torch.exp(-self.log_var_cat)
+            total = (
+                w_ts * losses['L_ts'] + self.log_var_ts +
+                w_cat * losses['L_catalysis'] + self.log_var_cat +
+                losses['L_barrier'] + losses['L_progress']
+            )
+            losses['weights'] = {
+                'w_ts': w_ts.item(),
+                'w_cat': w_cat.item(),
+            }
+        else:
+            # ✅ 固定权重（推荐）：目标值已归一化，损失量级一致
+            # L_ts和L_catalysis权重1:1，物理损失用小权重
+            total = (
+                losses['L_ts'] +
+                losses['L_catalysis'] +  # ✅ 1:1 配平
+                losses['L_barrier'] +
+                losses['L_progress']
+            )
+            losses['weights'] = {'w_ts': 1.0, 'w_cat': 1.0}
+
         losses['total'] = total
-        losses['weights'] = {
-            'w_ts': w_ts.item(),
-            'w_cat': w_cat.item(),
-            'sigma_ts': torch.exp(self.log_var_ts).item(),
-            'sigma_cat': torch.exp(self.log_var_cat).item(),
-        }
-        
         return total, losses
 
 
@@ -888,15 +881,14 @@ class TransitionBINN(nn.Module):
         gnn_layers: int = 3,
         n_ode_steps: int = 5,
         use_gate: bool = True,
+        use_learnable_weights: bool = False,  # ✅ 新增参数
     ):
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.cofactor_embed_dim = cofactor_embed_dim
-        
-        # ═══════════════════════════════════════════════════════
-        # 编码器（与原模型相同）
-        # ═══════════════════════════════════════════════════════
+
+        # ─────── 编码器 ───────
         self.ligand_encoder = LigandEncoder(
             atom_dim=79, edge_dim=10, hidden_dim=hidden_dim,
             num_layers=gnn_layers, heads=n_heads,
@@ -907,29 +899,22 @@ class TransitionBINN(nn.Module):
         self.cofactor_encoder = CofactorEncoder(
             cofactor_types=self.COFACTOR_TYPES, embed_dim=cofactor_embed_dim,
         )
-        
-        # ∗ 投影对齐
+
         self.ligand_proj = nn.Linear(hidden_dim, hidden_dim)
         self.cofactor_proj = nn.Linear(cofactor_embed_dim, hidden_dim)
-        
-        # ═══════════════════════════════════════════════════════
-        # BINN交互层（核心新组件）
-        # ═══════════════════════════════════════════════════════
+
+        # ─────── BINN交互层 ───────
         self.binn = ReactionCoordinateBINN(
             hidden_dim=hidden_dim,
             n_ode_steps=n_ode_steps,
             use_gate=use_gate,
         )
-        
-        # ═══════════════════════════════════════════════════════
-        # 预测头
-        # ═══════════════════════════════════════════════════════
+
+        # ─────── 预测头 ───────
         self.catalysis_head = BINNCatalysisHead(hidden_dim=hidden_dim)
-        
-        # ═══════════════════════════════════════════════════════
-        # 损失函数（可学习权重）
-        # ═══════════════════════════════════════════════════════
-        self.loss_fn = BINNLoss()
+
+        # ─────── 损失函数（可配置） ───────
+        self.loss_fn = BINNLoss(use_learnable_weights=use_learnable_weights)
 
     def forward(self,
                 ligand_data,
@@ -1032,19 +1017,24 @@ class TransitionBINN(nn.Module):
         return log_kcat_km
 
 
-def create_bin_optimizer(model: TransitionBINN, lr: float = 1e-4, weight_decay: float = 1e-5):
+def create_bin_optimizer(model: TransitionBINN, lr: float = 1e-4, weight_decay: float = 1e-5,
+                         use_learnable_weights: bool = False):
     """
     为TransitionBINN创建分组优化器
-    
-    不同于原模型，BINN的权重（dynamics_net, gate）需要不同的学习率
+
+    不同组件使用不同学习率：
+    - encoder: 正常学习率
+    - binn: 稍慢（稳定性优先）
+    - head: 稍快（快速学习预测映射）
+    - loss weights: 仅在use_learnable_weights=True时训练（更慢）
     """
     encoder_params = []
     binn_params = []
     head_params = []
     loss_params = []
-    
+
     for name, param in model.named_parameters():
-        if 'loss_fn' in name:
+        if 'loss_fn.log_var' in name and use_learnable_weights:
             loss_params.append(param)
         elif 'binn' in name:
             binn_params.append(param)
@@ -1052,13 +1042,17 @@ def create_bin_optimizer(model: TransitionBINN, lr: float = 1e-4, weight_decay: 
             head_params.append(param)
         else:
             encoder_params.append(param)
-    
-    return torch.optim.AdamW([
+
+    optimizer_groups = [
         {'params': encoder_params, 'lr': lr, 'weight_decay': weight_decay},
-        {'params': binn_params, 'lr': lr * 0.5, 'weight_decay': weight_decay},  # BINN稍慢
+        {'params': binn_params, 'lr': lr * 0.5, 'weight_decay': weight_decay},
         {'params': head_params, 'lr': lr * 2, 'weight_decay': weight_decay},
-        {'params': loss_params, 'lr': lr * 0.1, 'weight_decay': 0},  # 损失权重学习更慢
-    ])
+    ]
+
+    if loss_params:
+        optimizer_groups.append({'params': loss_params, 'lr': lr * 0.1, 'weight_decay': 0})
+
+    return torch.optim.AdamW(optimizer_groups)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
