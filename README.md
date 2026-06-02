@@ -5,15 +5,19 @@
 ## Quick Start
 
 ```bash
-cd dataset_building
-
-# 完整训练（GPU，推荐）
-python train.py --unified-metadata release/recommended_training_set.parquet \
-  --epochs 100 --batch-size 128 --device cuda
+cd /home/domi/AI4enz/dataset_building/models
 
 # 快速验证 (CPU)
-python train.py --unified-metadata release/recommended_training_set.parquet \
-  --epochs 10 --batch-size 32 --max-samples 5000 --device cpu
+python train.py --unified-metadata ../processed/oxidoreductase/unified_metadata.parquet \
+  --proteins-h5 ../processed/proteins.h5 \
+  --ligand-dir ../processed/ligands \
+  --epochs 10 --batch-size 32 --max-samples 5000 --device cpu --no-esm2
+
+# 完整训练（GPU，需要ESM-2）
+python train.py --unified-metadata ../processed/oxidoreductase/unified_metadata.parquet \
+  --proteins-h5 ../processed/proteins.h5 \
+  --ligand-dir ../processed/ligands \
+  --epochs 100 --batch-size 128 --device cuda
 ```
 
 ## Architecture
@@ -23,53 +27,57 @@ python train.py --unified-metadata release/recommended_training_set.parquet \
 - **kcat 路径**：Protein ESM-2 + Cofactor → log₁₀(kcat) [0,1]
 - **Score**：pKd + log_kcat = log₁₀(kcat/KM)
 
-### 技术改进
-- **激活函数**：GeLU（与ESM-2一致）
-- **目标归一化**：Min-Max到[0,1]（pkd:[0,14], kcat:[-6,7]）
-- **损失函数**：固定权重1:1（归一化后量级一致）
+### 核心创新
+- **过渡态理论**：替代Marcus方程，普适所有酶催化反应
+- **Neural ODE**：模拟反应坐标 ξ∈[0,1] 演化
+- **门控机制**：模拟"跨越能垒"过程
+- **GeLU激活**：与ESM-2一致，梯度更流畅
+
+### 损失函数
+```python
+L_total = L_ts + L_catalysis + 0.1*L_barrier + 0.01*L_progress
+# 权重1:1配平（Min-Max归一化后量级一致）
+```
 
 ## Dataset
 
 | Metric | Value |
 |--------|-------|
 | 总样本 | **233,134** |
-| pKd样本 | 163,927 (70%) |
-| kcat样本 | 74,514 (32%) |
-| 唯一蛋白 | 10,588 |
+| pKd样本 | 161,882 (69.4%) |
+| kcat样本 | 102,920 (44.1%) |
+| 双标签样本 | 32,444 (13.9%) |
+| 唯一蛋白 | 10,318 |
 | 唯一配体 | 89,283 |
 
-**数据集文件**（在 `release/` 目录）：
-- `recommended_training_set.parquet` — 主训练集（完整50列）
-- `recommended_training_set_compact.parquet` — 精简版（17列）
-- `pkd_subset.parquet` — 仅K d/Ki (163K)
-- `kcat_subset.parquet` — 仅kcat (75K)
+### Split分布
 
-数据来源：CatPred-DB, OED, SKiD, BindingDB
+| Split | 样本数 | 有kcat | 有pKd | 双标签 |
+|-------|--------|--------|-------|--------|
+| train | 187,511 | 42.0% | 70.3% | 23,075 |
+| val | 20,693 | 57.3% | 69.9% | 5,622 |
+| test | 24,930 | 49.4% | 70.7% | 5,016 |
 
-## Project Structure
+> [!NOTE]
+> Split按UniProt ID层级分配，test/val与train蛋白重叠仅~4%，避免蛋白序列泄漏。
 
-```
-AI4enz/
-├── README.md                    # 本文件
-├── CLAUDE.md                    # 详细项目文档
-└── dataset_building/
-    ├── ranking_model.py         # TransitionBINN 模型
-    ├── train.py                 # 训练脚本
-    ├── inference_enzyme_mining.py
-    ├── release/                 # 训练数据集（需单独下载）
-    ├── checkpoints/             # 模型检查点
-    └── external_data/           # 原始数据源
-```
+### 数据来源
+- CatPred-DB (Nature Comms 2025): kcat, Ki
+- OED (NAR 2025): kcat, Km, kcat/Km
+- SKiD (Scientific Data 2025): kcat, Km + 3D结构
+- BindingDB: Kd, Ki
 
-## 数据集使用建议
+## 测量类型
 
-| 阶段 | 数据集 | 权重 |
+| 类型 | 可信度 | 权重 |
 |------|--------|------|
-| 预训练pKd | `pkd_subset.parquet` | L_ts=1, L_cat=0 |
-| 联合训练 | `recommended_training_set.parquet` | L_ts=1, L_cat=1 |
+| Kd | 高 | 1.0 |
+| Ki | 中-高 | 0.7 |
+| kinetics | 中 | 0.5 |
 
 ## Requirements
 
 - PyTorch ≥ 2.0 + PyTorch Geometric
-- ESM-2 (transformers)
+- ESM-2 (transformers, 可选，默认用AA属性)
 - RDKit
+- h5py

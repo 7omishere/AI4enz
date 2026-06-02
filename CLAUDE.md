@@ -65,18 +65,35 @@ L_total = L_ts + L_catalysis + 0.1*L_barrier + 0.01*L_progress
 AI4enz/
 ├── README.md                              # 项目简介
 ├── CLAUDE.md                              # 本文件
+├── scripts/                               # 数据处理脚本
+│   ├── crawlers/                          # 数据爬取/解析
+│   │   ├── fetch_kegg_mapping.py          # KEGG API 爬取
+│   │   ├── fetch_uniprot_ec_mapping.py    # UniProt API 爬取
+│   │   ├── parse_swissprot.py             # SwissProt 解析
+│   │   ├── parse_kegg_batch.py            # KEGG 批量查询
+│   │   └── merge_bindingdb.py             # BindingDB 数据合并
+│   └── processors/                        # 数据处理
+│       ├── merge_external_data.py         # 外部数据整合
+│       ├── extract_domains.py             # 结构域提取
+│       ├── enrich_domains_pfam.py         # Pfam 富集
+│       └── compute_esm2_embeddings.py     # ESM2 嵌入计算
 └── dataset_building/
-    ├── ranking_model.py                   # TransitionBINN 模型定义
-    ├── train.py                           # 训练脚本
-    ├── inference_enzyme_mining.py          # 酶挖掘推理
-    ├── evaluate_model.py                   # 模型评估
+    ├── models/                            # 模型核心
+    │   ├── ranking_model.py               # TransitionBINN 模型定义
+    │   ├── train.py                       # 训练脚本
+    │   └── __init__.py
+    ├── evaluation/                        # 模型评估
+    │   └── evaluate_model.py
+    ├── analysis/                          # 分析与可视化
+    │   ├── plot_*.py                      # 绘图脚本
+    │   ├── analyze_metrics.py
+    │   ├── ablation_study.py
+    │   ├── baseline_comparison*.py
+    │   └── diagnose_fluctuation.py
     ├── release/                           # 训练数据集
-    │   ├── recommended_training_set.parquet
-    │   ├── recommended_training_set_compact.parquet
-    │   ├── pkd_subset.parquet
-    │   └── kcat_subset.parquet
-    ├── checkpoints/                       # 模型检查点
-    └── external_data/                     # 原始数据源
+    ├── processed/                         # 处理后数据
+    ├── external_data/                     # 原始数据源
+    └── checkpoints/                       # 模型检查点
 ```
 
 ## 虚拟环境
@@ -85,16 +102,31 @@ AI4enz/
 source /home/domi/BINN/.venv/bin/activate
 ```
 
+### 测量类型分布
+
+| 类型 | 数量 | 可信度 | 权重 |
+|------|------|--------|------|
+| Ki | ~150,000 | 中-高 | 0.7 |
+| Kd | ~14,570 | 高 | 1.0 |
+| kinetics | ~36,000 | 中 | 0.5 |
+| kcat_only | ~69,000 | 中 | — |
+
 ## 训练命令
 
 ```bash
-cd /home/domi/AI4enz/dataset_building
+cd /home/domi/AI4enz/dataset_building/models
 
 # 快速验证（CPU, 小样本）
-python train.py --epochs 10 --batch-size 32 --max-samples 5000 --device cpu
+python train.py --unified-metadata ../processed/oxidoreductase/unified_metadata.parquet \
+  --proteins-h5 ../processed/proteins.h5 \
+  --ligand-dir ../processed/ligands \
+  --epochs 10 --batch-size 32 --max-samples 5000 --device cpu
 
 # 完整训练（GPU）
-python train.py --epochs 100 --batch-size 128 --device cuda
+python train.py --unified-metadata ../processed/oxidoreductase/unified_metadata.parquet \
+  --proteins-h5 ../processed/proteins.h5 \
+  --ligand-dir ../processed/ligands \
+  --epochs 100 --batch-size 128 --device cuda
 ```
 
 ## 数据集
@@ -104,20 +136,25 @@ python train.py --epochs 100 --batch-size 128 --device cuda
 | 指标 | 值 |
 |------|-----|
 | 总记录 | **233,134** |
-| pKd有效 | 163,927 (70.3%) |
-| kcat有效 | 74,514 (32.0%) |
-| 唯一蛋白 | 10,588 |
+| pKd有效 | 161,882 (69.4%) |
+| kcat有效 | 102,920 (44.1%) |
+| 双标签(pKd+kcat) | 32,444 (13.9%) |
+| 唯一蛋白 | 10,318 |
 | 唯一配体 | 89,283 |
+
+> [!NOTE]
+> kcat数据已通过UniProtID精准补充：原始74,514条 → 补充后102,920条 (+28,406条)
+> 补充文件：`release/recommended_training_set_kcat_supplemented.parquet`
 
 ### Split
 
-| 切分 | 样本数 | pKd | kcat | 双标签 |
-|------|--------|-----|------|--------|
-| train | 187,511 | 131,835 | 59,302 | 3,626 |
-| val | 20,693 | 14,464 | 6,634 | 405 |
-| test | 24,930 | 17,628 | 8,578 | 1,276 |
+| 切分 | 样本数 | 总占比 | 有kcat | 有pKd | 双标签 |
+|------|--------|--------|--------|-------|--------|
+| train | 187,511 | 80.4% | 78,751 (42.0%) | 131,835 | 23,075 |
+| val | 20,693 | 8.9% | 11,851 (57.3%) | 14,464 | 5,622 |
+| test | 24,930 | 10.7% | 12,318 (49.4%) | 17,628 | 5,016 |
 
-Split 按 UniProt ID 层级分配，避免蛋白序列泄漏。
+Split 按 **UniProt ID 层级**分配，test/val与train蛋白重叠仅~4%，避免蛋白序列泄漏。
 
 ### 测量类型分布
 
@@ -146,7 +183,7 @@ python train.py --dataset release/recommended_training_set.parquet \
 
 ## 关键设计决策
 
-1. **过渡态理论**：替代 Marcus 方程（后者在 100% 蛋白上失败）
+1. **过渡态理论**：替代 Marcus 方程（后者在 ~100% 蛋白上失败）
 2. **Hybrid 架构**：kcat 独立路径，避免底物级/蛋白级表征冲突
 3. **Min-Max 归一化**：目标值统一到[0,1]，损失量级自然一致
 4. **GeLU激活**：与ESM-2一致，梯度更流畅
@@ -157,7 +194,8 @@ python train.py --dataset release/recommended_training_set.parquet \
 | 优先级 | 问题 | 说明 |
 |--------|------|------|
 | 🟡 中 | L_barrier权重 | 建议先设为0测试，看模型自然学习效果 |
-| 🟡 中 | 双标签样本少 | 仅5,307个(2.3%)，但对score预测重要 |
+| 🟡 中 | kcat补充可信度 | UniProtID精准补充的28,406条建议降权 |
+| 🟡 中 | 双标签样本少 | 32,444个(13.9%)，是score预测的核心 |
 | 🟢 低 | 辅因子覆盖 | 可后续补充稀有辅因子 |
 
 ## 数据来源
