@@ -23,6 +23,7 @@ import sys
 import json
 import pickle
 import argparse
+import contextlib
 import logging
 from pathlib import Path
 from typing import Optional
@@ -415,7 +416,7 @@ def collate_fn(batch: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 class Trainer:
-    """训练循环封装"""
+    """训练循环封装。支持 CPU / GPU、AMP 混合精度、torch.compile。"""
 
     def __init__(self,
                  model: nn.Module,
@@ -428,13 +429,30 @@ class Trainer:
                  checkpoint_dir: str = "checkpoints",
                  optimizer_fn=None,
                  model_type: str = "bin",
+                 use_amp: bool = False,
+                 use_compile: bool = False,
+                 grad_accum_steps: int = 1,
                  ):
-        self.model = model.to(device)
         self.device = device
+        self.use_amp = use_amp and device.startswith("cuda")
+        self.grad_accum_steps = grad_accum_steps
+
+        # ── torch.compile (PyTorch ≥ 2.0) ──
+        if use_compile:
+            if hasattr(torch, 'compile'):
+                log.info("Compiling model with torch.compile (mode='reduce-overhead')...")
+                model = torch.compile(model, mode="reduce-overhead")
+            else:
+                log.warning("torch.compile not available (requires PyTorch ≥ 2.0), skipping.")
+
+        self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
         self.model_type = model_type
+
+        # ── AMP scaler (CUDA only) ──
+        self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
 
         self.global_step = 0
 
@@ -442,7 +460,7 @@ class Trainer:
             self.optimizer = optimizer_fn(model, lr=lr, weight_decay=weight_decay)
         else:
             self.optimizer = create_trenzition_optimizer(model, lr=lr, weight_decay=weight_decay)
-        
+
         self.scheduler = CosineAnnealingWarmRestarts(
             self.optimizer, T_0=5000, T_mult=2,
         )
@@ -454,56 +472,77 @@ class Trainer:
         self.train_losses: list[float] = []
         self.val_losses: list[float] = []
 
+        if self.use_amp:
+            log.info("AMP (automatic mixed precision) enabled — bfloat16/float16")
+        if self.grad_accum_steps > 1:
+            log.info(f"Gradient accumulation: {self.grad_accum_steps} steps "
+                     f"(effective batch={self.grad_accum_steps * train_loader.batch_size})")
+
     def train_epoch(self, epoch: int) -> dict:
         self.model.train()
         epoch_losses = {}
+        self.optimizer.zero_grad()
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
-        for batch in pbar:
-            self.global_step += 1
-
+        for batch_idx, batch in enumerate(pbar):
             # 移动到设备
             batch_gpu = {
-                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
             # 特殊处理 PyG Batch 对象
             batch_gpu["ligand_data"] = batch_gpu["ligand_data"].to(self.device)
 
-            # 前向
-            outputs = self.model(
-                batch_gpu["ligand_data"],
-                batch_gpu["seq_embed"],
-                batch_gpu["cofactor_strs"],
-                batch_gpu["struct_feat"],
-                batch_gpu["has_structure"],
-                domain_masks=batch_gpu.get("domain_masks"),
-                domain_padding_mask=batch_gpu.get("domain_padding_mask"),
-                pocket_cn=batch_gpu.get("pocket_cn"),
-                pocket_pi=batch_gpu.get("pocket_pi"),
-                pocket_dist=batch_gpu.get("pocket_dist"),
-                pocket_mask=batch_gpu.get("pocket_mask"),
-            )
+            # ── 前向（AMP 可选） ──
+            with torch.amp.autocast("cuda") if self.use_amp else contextlib.nullcontext():
+                outputs = self.model(
+                    batch_gpu["ligand_data"],
+                    batch_gpu["seq_embed"],
+                    batch_gpu["cofactor_strs"],
+                    batch_gpu["struct_feat"],
+                    batch_gpu["has_structure"],
+                    domain_masks=batch_gpu.get("domain_masks"),
+                    domain_padding_mask=batch_gpu.get("domain_padding_mask"),
+                    pocket_cn=batch_gpu.get("pocket_cn"),
+                    pocket_pi=batch_gpu.get("pocket_pi"),
+                    pocket_dist=batch_gpu.get("pocket_dist"),
+                    pocket_mask=batch_gpu.get("pocket_mask"),
+                )
 
-            # 损失
-            total_loss, losses = self.model.compute_loss(
-                outputs,
-                {
-                    "pkd_target": batch_gpu["pkd_target"],
-                    "pkd_target_mask": batch_gpu["pkd_target_mask"],
-                    "log_kcat_target": batch_gpu["log_kcat_target"],
-                    "kcat_target_mask": batch_gpu["kcat_target_mask"],
-                    "kcat_weights": batch_gpu["kcat_weights"],
-                    "quality_weight": batch_gpu["quality_weight"],
-                },
-            )
+                # 损失
+                total_loss, losses = self.model.compute_loss(
+                    outputs,
+                    {
+                        "pkd_target": batch_gpu["pkd_target"],
+                        "pkd_target_mask": batch_gpu["pkd_target_mask"],
+                        "log_kcat_target": batch_gpu["log_kcat_target"],
+                        "kcat_target_mask": batch_gpu["kcat_target_mask"],
+                        "kcat_weights": batch_gpu["kcat_weights"],
+                        "quality_weight": batch_gpu["quality_weight"],
+                    },
+                )
+                # 梯度累积归一化
+                total_loss = total_loss / self.grad_accum_steps
 
-            # 反向传播
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            self.scheduler.step()
+            # ── 反向传播 ──
+            if self.use_amp:
+                self.scaler.scale(total_loss).backward()
+            else:
+                total_loss.backward()
+
+            # 梯度累积：每 grad_accum_steps 步更新一次
+            if (batch_idx + 1) % self.grad_accum_steps == 0:
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optimizer.step()
+                self.optimizer.zero_grad()
+                self.scheduler.step()
+                self.global_step += 1
 
             # 累加（跳过 weights 字典）
             for k, v in losses.items():
@@ -529,7 +568,7 @@ class Trainer:
 
         for batch in tqdm(self.val_loader, desc="Validating", leave=False):
             batch_gpu = {
-                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
             # 特殊处理 PyG Batch 对象
@@ -579,6 +618,8 @@ class Trainer:
             "global_step": self.global_step,
             "best_val_loss": self.best_val_loss,
         }
+        if self.scaler is not None:
+            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
         if extra:
             checkpoint.update(extra)
 
@@ -593,6 +634,8 @@ class Trainer:
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.global_step = checkpoint["global_step"]
         self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        if self.scaler is not None and "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
         log.info(f"Checkpoint loaded from {path} (step {self.global_step})")
 
     def fit(self, epochs: int, save_every: int = 10):
@@ -653,7 +696,7 @@ class Trainer:
         total_losses = {}
         for batch in tqdm(loader, desc=desc, leave=False):
             batch_gpu = {
-                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
             # 特殊处理 PyG Batch 对象
@@ -717,9 +760,16 @@ def main():
                         help="BINN的ODE积分步数")
     parser.add_argument("--no-gate", action="store_true",
                         help="禁用BINN的门控机制")
-    # 硬件
+    # 硬件 / GPU
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader workers (GPU: 4-8, CPU: 0-2)")
+    parser.add_argument("--amp", action="store_true",
+                        help="Enable AMP mixed precision (CUDA only, ~2x speed, less VRAM)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile (PyTorch ≥ 2.0, ~30%% speedup on GPU)")
+    parser.add_argument("--grad-accum", type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch_size × grad_accum)")
     parser.add_argument("--no-esm2", action="store_true",
                         help="Use AA properties instead of ESM-2 (default: ESM-2)")
     # 检查点
@@ -748,17 +798,21 @@ def main():
         use_esm2=not args.no_esm2,
     )
 
+    use_cuda = args.device.startswith("cuda")
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True,
+        collate_fn=collate_fn, num_workers=args.num_workers,
+        pin_memory=use_cuda, persistent_workers=use_cuda and args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True,
+        collate_fn=collate_fn, num_workers=min(args.num_workers, 2),
+        pin_memory=use_cuda, persistent_workers=False,
     )
     test_loader = DataLoader(
         test_dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True,
+        collate_fn=collate_fn, num_workers=min(args.num_workers, 2),
+        pin_memory=use_cuda, persistent_workers=False,
     )
 
     # ── 模型 ──
@@ -784,6 +838,9 @@ def main():
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
         optimizer_fn=optimizer_fn,
+        use_amp=args.amp,
+        use_compile=args.compile,
+        grad_accum_steps=args.grad_accum,
     )
 
     if args.resume:

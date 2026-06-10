@@ -139,16 +139,16 @@ source /home/domi/BINN/.venv/bin/activate
 cd /home/domi/AI4enz/dataset_building/models
 
 # 快速验证（CPU, 小样本）
-python train.py --unified-metadata ../processed/metadata.parquet \
-  --proteins-h5 ../processed/proteins.h5 \
-  --ligand-dir ../processed/ligands \
-  --epochs 10 --batch-size 32 --max-samples 5000 --device cpu
+python train.py --epochs 10 --batch-size 32 --max-samples 5000 --device cpu --num-workers 0
 
-# 完整训练（CPU，当前环境无 GPU）
-python train.py --unified-metadata ../processed/metadata.parquet \
-  --proteins-h5 ../processed/proteins.h5 \
-  --ligand-dir ../processed/ligands \
-  --epochs 100 --batch-size 128 --device cpu
+# 完整训练（CPU）
+python train.py --epochs 100 --batch-size 128 --device cpu --num-workers 2
+
+# GPU 全优化训练（推荐）
+python train.py --epochs 100 --batch-size 256 --device cuda --num-workers 8 --amp --compile
+
+# GPU 小显存 (< 16GB)
+python train.py --epochs 100 --batch-size 64 --device cuda --num-workers 4 --amp --grad-accum 2
 ```
 
 ## 数据集 — trenzition V5

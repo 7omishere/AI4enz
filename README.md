@@ -82,16 +82,83 @@ L_total = L_ts + L_catalysis + 0.1*L_barrier + 0.01*L_progress
 | Kd | 37,499 | 高 | 1.0 |
 | IC50_approx | 249 | 低-中 | 0.4 |
 
+## GPU 训练
+
+### 环境配置
+
+```bash
+# 1. CUDA Toolkit (建议 ≥ 12.1)
+nvidia-smi                          # 确认 GPU 驱动可用
+
+# 2. 创建虚拟环境 (Python ≥ 3.10)
+python -m venv .venv
+source .venv/bin/activate
+
+# 3. PyTorch + CUDA
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# 4. PyTorch Geometric (匹配 PyTorch 版本)
+pip install torch_geometric
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+  -f https://data.pyg.org/whl/torch-2.0.0+cu121.html
+
+# 5. 其他依赖
+pip install rdkit h5py pandas numpy tqdm transformers fair-esm
+```
+
+### 训练命令
+
+```bash
+cd dataset_building/models
+
+# === 基础 GPU 训练 ===
+python train.py --epochs 100 --batch-size 128 --device cuda
+
+# === GPU 全优化（推荐） ===
+python train.py \
+  --epochs 100 --batch-size 256 \
+  --device cuda --num-workers 8 \
+  --amp --compile --grad-accum 1
+
+# === 显存不足时 (VRAM < 16GB) ===
+python train.py \
+  --epochs 100 --batch-size 64 \
+  --device cuda --num-workers 4 \
+  --amp --grad-accum 2
+```
+
+### GPU 参数说明
+
+| 参数 | 作用 | 建议值 |
+|------|------|--------|
+| `--device cuda` | 使用 GPU 训练 | — |
+| `--amp` | 自动混合精度，~2× 加速，显存减半 | 始终开启 |
+| `--compile` | torch.compile，~30% 加速 (PyTorch ≥ 2.0) | 首次编译慢，后续生效 |
+| `--grad-accum N` | 梯度累积，等效 batch = batch_size × N | VRAM 不足时用 |
+| `--num-workers N` | DataLoader 并行加载 | GPU: 4-8, CPU: 2-4 |
+| `--batch-size N` | 每步样本数 | 大显存: 256, 小显存: 64 |
+
+### 性能估算
+
+| 硬件 | batch_size | ~时间/epoch | 100 epochs |
+|------|-----------|-------------|------------|
+| CPU (i7) | 128 | ~40 min | ~67 h |
+| RTX 3090 (24GB) | 128 | ~2 min | ~3.5 h |
+| RTX 4090 (24GB) | 256 | ~1 min | ~1.7 h |
+| A100 (40GB) | 512 | ~30 s | ~50 min |
+| RTX 3060 (12GB) | 64 + grad_accum 2 | ~5 min | ~8 h |
+
 ## Requirements
 
 - PyTorch ≥ 2.0 + PyTorch Geometric
 - ESM-2 (esm2_t33_650M_UR50D)
 - RDKit
 - h5py
+- **GPU 训练**: CUDA Toolkit ≥ 12.1, NVIDIA 驱动 ≥ 525
 
 ## 最新更新 (2026-06-11)
 
 - ✅ ESM-2 蛋白编码完成：19,278 个蛋白，366 min (CPU)
 - ✅ 配体 GNN 编码完成：7,273 个配体，5 个无机离子剔除
-- ⬜ 待验证训练管线
-- ⬜ 待开始 CPU 训练
+- ✅ 训练管线验证通过：端到端 forward + backward + loss，2 epochs
+- ✅ GPU 训练支持：AMP 混合精度 + torch.compile + 梯度累积
