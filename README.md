@@ -5,19 +5,20 @@
 ## Quick Start
 
 ```bash
+source /home/domi/BINN/.venv/bin/activate
 cd /home/domi/AI4enz/dataset_building/models
 
 # 快速验证 (CPU)
-python train.py --unified-metadata ../processed/oxidoreductase/unified_metadata.parquet \
+python train.py --unified-metadata ../processed/metadata.parquet \
   --proteins-h5 ../processed/proteins.h5 \
   --ligand-dir ../processed/ligands \
-  --epochs 10 --batch-size 32 --max-samples 5000 --device cpu --no-esm2
+  --epochs 10 --batch-size 32 --max-samples 5000 --device cpu
 
-# 完整训练（GPU，需要ESM-2）
-python train.py --unified-metadata ../processed/oxidoreductase/unified_metadata.parquet \
+# 完整训练 (CPU)
+python train.py --unified-metadata ../processed/metadata.parquet \
   --proteins-h5 ../processed/proteins.h5 \
   --ligand-dir ../processed/ligands \
-  --epochs 100 --batch-size 128 --device cuda
+  --epochs 100 --batch-size 128 --device cpu
 ```
 
 ## Architecture
@@ -39,31 +40,33 @@ L_total = L_ts + L_catalysis + 0.1*L_barrier + 0.01*L_progress
 # 权重1:1配平（Min-Max归一化后量级一致）
 ```
 
-## Dataset
+## Dataset — trenzition V5
 
 | Metric | Value |
 |--------|-------|
-| 总样本 | **233,134** |
-| pKd样本 | 161,980 (69.5%) |
-| kcat样本 | 74,697 (32.0%) |
-| **EC号样本** | **140,897 (60.4%)** |
-| 双标签样本 | 5,495 (2.4%) |
-| 唯一蛋白 | 10,318 |
-| 唯一配体 | 89,283 |
+| 总样本 | **98,506** |
+| pKd样本 | 72,361 (73.5%) |
+| kcat样本 | 93,652 (95.1%) |
+| **双标签样本** | **67,507 (68.5%)** |
+| EC号样本 | 98,506 (100%) |
+| 唯一蛋白 | 19,278 |
+| 唯一配体 | 7,273 |
 
-> [!NOTE]
-> **数据增强 (2026-06-06)**: EC号覆盖率 36.9% → 60.4%，通过UniProt REST API补充636个蛋白的EC号。增强数据集：`release/recommended_training_set_enriched.parquet`
+### Split分布（蛋白层级，零泄漏）
 
-### Split分布
+| Split | 样本数 | 蛋白数 | pKd | kcat |
+|-------|--------|--------|-----|------|
+| train | 69,738 | 13,494 | 51,466 | 66,280 |
+| val | 13,956 | 2,892 | 10,288 | 13,233 |
+| test | 14,812 | 2,892 | 10,607 | 14,139 |
 
-| Split | 样本数 | 有EC号 | 有pKd | 有kcat |
-|-------|--------|--------|-------|--------|
-| train | 187,511 | 110,354 | 130,261 | 59,485 |
-| val | 20,693 | 13,712 | 14,303 | 6,634 |
-| test | 24,930 | 16,831 | 17,416 | 8,578 |
+### 编码状态
 
-> [!NOTE]
-> Split按UniProt ID层级分配，test/val与train蛋白重叠仅~4%，避免蛋白序列泄漏。
+| 组件 | 覆盖率 | 方式 |
+|------|--------|------|
+| 蛋白 | 19,278/19,278 (100%) | ESM-2 (esm2_t33_650M, 1280-dim) |
+| 配体 | 7,273/7,278 (99.9%) | GNN (GATv2, 79-dim atom + 10-dim bond) |
+| 无机离子 | 5 种不可编码 → 已剔除 | Ag⁺, Co, S, NO, Na⁺ |
 
 ### 数据来源
 - CatPred-DB (Nature Comms 2025): kcat, Ki
@@ -73,15 +76,22 @@ L_total = L_ts + L_catalysis + 0.1*L_barrier + 0.01*L_progress
 
 ## 测量类型
 
-| 类型 | 可信度 | 权重 |
-|------|--------|------|
-| Kd | 高 | 1.0 |
-| Ki | 中-高 | 0.7 |
-| kinetics | 中 | 0.5 |
+| 类型 | 数量 | 可信度 | 权重 |
+|------|------|--------|------|
+| Ki | 60,758 | 中-高 | 0.7 |
+| Kd | 37,499 | 高 | 1.0 |
+| IC50_approx | 249 | 低-中 | 0.4 |
 
 ## Requirements
 
 - PyTorch ≥ 2.0 + PyTorch Geometric
-- ESM-2 (transformers, 可选，默认用AA属性)
+- ESM-2 (esm2_t33_650M_UR50D)
 - RDKit
 - h5py
+
+## 最新更新 (2026-06-11)
+
+- ✅ ESM-2 蛋白编码完成：19,278 个蛋白，366 min (CPU)
+- ✅ 配体 GNN 编码完成：7,273 个配体，5 个无机离子剔除
+- ⬜ 待验证训练管线
+- ⬜ 待开始 CPU 训练

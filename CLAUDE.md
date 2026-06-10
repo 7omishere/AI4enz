@@ -59,10 +59,33 @@ L_total = L_ts + L_catalysis + 0.1*L_barrier + 0.01*L_progress
 | pKd | [0, 14] | pk d_min=0.0, pkd_max=14.0 | [0, 1] |
 | log₁₀(kcat) | [-6, 7] | kcat_min=-6.0, kcat_max=7.0 | [0, 1] |
 
+## 数据与脚本组织原则
+
+1. **数据按来源分文件夹**：下载新数据集时，在 `dataset_building/` 下创建以数据库名命名的文件夹（如 `BindingDB/`、`BRENDA/`、`OED/`），原始文件直接放入。禁止将多个来源的数据混放在同一目录。
+2. **同类脚本同目录**：同一子项目的脚本位于同一文件夹（如 `scripts/crawlers/` 放爬虫、`scripts/processors/` 放特征工程、`pipeline/` 放处理流水线）。新增子项目时创建对应文件夹。
+
 ## 项目结构
 
 ```
 AI4enz/
+├── dataset_building/
+│   ├── BindingDB/              # BindingDB 原始数据
+│   ├── BRENDA/                 # BRENDA 原始数据
+│   ├── CataPro/                # CataPro 源码+数据
+│   ├── KEGG/                   # KEGG 酶/EC 数据
+│   ├── OED/                    # OED 动力学数据
+│   ├── SABIO-RK/               # SABIO-RK（API获取，暂空）
+│   ├── SKiD/                   # SKiD 数据+kcat_archive
+│   ├── turnup/                 # TurnUp 分子文件数据
+│   ├── uniprotprot/            # UniProt/SwissProt 数据库
+│   ├── models/                 # 模型定义+训练+权重
+│   ├── pipeline/               # 数据处理流水线 (01-08)
+│   ├── scripts/                # 数据构建/补充脚本
+│   ├── analysis/               # 图表与分析
+│   ├── evaluation/             # 模型评估
+│   ├── checkpoints/            # 训练输出快照
+│   ├── release/                # 最终训练数据集
+│   └── processed/ → BINN/      # 中间产物（符号链接）
 ├── README.md                              # 项目简介
 ├── CLAUDE.md                              # 本文件
 ├── scripts/                               # 数据处理脚本
@@ -106,10 +129,9 @@ source /home/domi/BINN/.venv/bin/activate
 
 | 类型 | 数量 | 可信度 | 权重 |
 |------|------|--------|------|
-| Ki | ~150,000 | 中-高 | 0.7 |
-| Kd | ~14,570 | 高 | 1.0 |
-| kinetics | ~36,000 | 中 | 0.5 |
-| kcat_only | ~69,000 | 中 | — |
+| Ki | 60,758 | 中-高 | 0.7 |
+| Kd | 37,499 | 高 | 1.0 |
+| IC50_approx | 249 | 低-中 | 0.4 |
 
 ## 训练命令
 
@@ -117,76 +139,95 @@ source /home/domi/BINN/.venv/bin/activate
 cd /home/domi/AI4enz/dataset_building/models
 
 # 快速验证（CPU, 小样本）
-python train.py --unified-metadata ../processed/oxidoreductase/unified_metadata.parquet \
+python train.py --unified-metadata ../processed/metadata.parquet \
   --proteins-h5 ../processed/proteins.h5 \
   --ligand-dir ../processed/ligands \
   --epochs 10 --batch-size 32 --max-samples 5000 --device cpu
 
-# 完整训练（GPU）
-python train.py --unified-metadata ../processed/oxidoreductase/unified_metadata.parquet \
+# 完整训练（CPU，当前环境无 GPU）
+python train.py --unified-metadata ../processed/metadata.parquet \
   --proteins-h5 ../processed/proteins.h5 \
   --ligand-dir ../processed/ligands \
-  --epochs 100 --batch-size 128 --device cuda
+  --epochs 100 --batch-size 128 --device cpu
 ```
 
-## 数据集
+## 数据集 — trenzition V5
 
 ### 全局统计
 
 | 指标 | 值 |
 |------|-----|
-| 总记录 | **233,134** |
-| pKd有效 | 161,980 (69.5%) |
-| kcat有效 | 74,697 (32.0%) |
-| 双标签(pKd+kcat) | 5,495 (2.4%) |
-| **EC号** | **140,897 (60.4%)** |
-| 唯一蛋白 | 10,318 |
-| 唯一配体 | 89,283 |
+| 总记录 | **98,506** |
+| pKd有效 | 72,361 (73.5%) |
+| kcat有效 | 93,652 (95.1%) |
+| 双标签(pKd+kcat) | 67,507 (68.5%) |
+| **EC号** | **98,506 (100%)** |
+| 唯一蛋白 | 19,278 |
+| 唯一配体 | 7,273 |
 
-> [!NOTE]
-> **数据增强 (2026-06-06)**:
-> - EC号：36.9% → 60.4% (+23.5%)，通过UniProt REST API补充
-> - pKd异常值清洗：消除1,947条(<0或>14)
-> - 增强数据集：`release/recommended_training_set_enriched.parquet`
+### 编码状态
 
-### Split
+| 组件 | 覆盖率 | 编码方式 |
+|------|--------|----------|
+| 蛋白 ESM-2 | 19,278/19,278 (100%) | esm2_t33_650M, 1280-dim mean-pool |
+| 配体 GNN | 7,273/7,278 (99.9%) | GATv2, 79-dim 原子特征 + 10-dim 键特征 |
+| 无机离子 | 5 种 (Ag⁺, Co, S, NO, Na⁺) | 不可编码，已剔除 |
 
-| 切分 | 样本数 | 总占比 | 有EC号 | 有pKd | 有kcat |
-|------|--------|--------|--------|-------|--------|
-| train | 187,511 | 80.4% | 110,354 | 130,261 | 59,485 |
-| val | 20,693 | 8.9% | 13,712 | 14,303 | 6,634 |
-| test | 24,930 | 10.7% | 16,831 | 17,416 | 8,578 |
+### Split（蛋白层级，零泄漏）
 
-Split 按 **UniProt ID 层级**分配，test/val与train蛋白重叠仅~4%，避免蛋白序列泄漏。
+| 切分 | 样本数 | 蛋白数 | pKd | kcat |
+|------|--------|--------|-----|------|
+| train | 69,738 | 13,494 | 51,466 | 66,280 |
+| val | 13,956 | 2,892 | 10,288 | 13,233 |
+| test | 14,812 | 2,892 | 10,607 | 14,139 |
+
+Split 按 **protein_seq_hash 层级**分配，test/val与train蛋白完全零重叠。
 
 ### 测量类型分布
 
 | 类型 | 数量 | 可信度 | 权重 |
 |------|------|--------|------|
-| Ki | 149,357 | 中-高 | 0.7 |
-| Kd | 14,570 | 高 | 1.0 |
-| kinetics | 35,703 | 中 | 0.5 |
-| kcat_only | 33,504 | 中 | 0.5 |
+| Ki | 60,758 | 中-高 | 0.7 |
+| Kd | 37,499 | 高 | 1.0 |
+| IC50_approx | 249 | 低 | 0.4 |
 
 ## 已知问题
 
 | 优先级 | 问题 | 说明 |
 |--------|------|------|
-| 🟡 中 | kcat覆盖不足 | 仅32%，建议从SABIO-RK手动导出补充 |
-| 🟡 中 | 双标签样本少 | 5,495个(2.4%)，限制log(kcat/KM)预测 |
-| 🟡 中 | EC号补充瓶颈 | 剩余39.6%蛋白确实无UniProt催化注释 |
+| 🟡 中 | 无 GPU | CPU 训练较慢（无 CUDA） |
+| 🟡 中 | proteins.h5 含历史数据 | 53,133 个蛋白中仅 19,278 用于当前训练集 |
 | 🟢 低 | 辅因子覆盖 | 可后续补充稀有辅因子 |
+| 🟢 低 | 结构/口袋特征未启用 | metadata 中 has_structure/has_binding_site 均为默认值 |
 
 ## 数据来源
 
 | 来源 | 提供数据 | 规模 |
 |------|----------|------|
-| CatPred-DB (Nature Comms 2025) | kcat, Ki | 20k+11k |
+| CatPred-DB (Nature Comms 2025) | kcat, Ki | 31k |
 | OED (NAR 2025) | kcat, Km, kcat/Km | 36k |
-| SKiD (Scientific Data 2025) | kcat, Km + 3D结构 | 13k+18k |
-| BindingDB | Kd, Ki | 14k+135k |
+| SKiD (Scientific Data 2025) | kcat, Km + 3D结构 | 13k |
+| BindingDB | Kd, Ki | 153k |
+| **PDBbind v2020R1 (PDBbind+)** | **Kd, Ki, 3D结构** | **19k** |
 
-## GitHub
+## 当前任务进度 (2026-06-11)
 
-- **仓库**: https://github.com/7omishere/AI4enz
-- 代码通过Git分发，数据集通过云盘传输
+### 已完成
+- [x] trenzition V5 数据集 SMILES 100% 补齐
+- [x] **metadata.parquet** — 98,506 条，train/val/test 70/15/15 蛋白级划分（零泄漏）
+  - train: 69,738 / val: 13,956 / test: 14,812
+- [x] **ESM-2 蛋白编码** — 19,278/19,278 (100%)，esm2_t33_650M，1280-dim mean-pooled
+  - 总耗时 366 min (0.6 seq/s, CPU)，`proteins.h5` 18 GB
+- [x] **配体 GNN 编码** — 7,273/7,278 (99.9%)，GATv2 图编码，79-dim 原子特征 + 10-dim 键特征
+  - 5 个单原子/无机离子 (Ag⁺, Co, S, NO, Na⁺) 无法建图，已从 metadata 剔除（11 条记录）
+- [x] Pantheon CLI 全线改为 minimax-m27 + key
+
+### 待完成
+- [ ] 验证管线: metadata + proteins.h5 + ligands forward pass + loss
+- [ ] 开始训练: `python models/train.py --epochs 100 --batch-size 128`
+  - 训练参数: `--unified-metadata processed/metadata.parquet --proteins-h5 processed/proteins.h5 --ligand-dir processed/ligands`
+
+### 重要提醒
+- `/tmp` 容易满（tmpfs 7.7G），后台任务日志写项目目录而非 /tmp
+- 训练质量权重全平权 (quality_weight=1.0)
+- 无 GPU，一切 CPU 运行
