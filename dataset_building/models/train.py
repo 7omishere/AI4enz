@@ -98,12 +98,12 @@ THERMO_WEIGHT = {
 # 用于平衡 pKd 和 log_kcat 的损失量级
 # ─────────────────────────────────────────────────────────────
 NORM_PARAMS = {
-    # pKd: 范围 [0, 14] → [0, 1]
+    # pKd: 范围 [0, 12] → [0, 1]（数据 P99.9=10.32，留余量至 12）
     'pkd_min': 0.0,
-    'pkd_max': 14.0,
-    # log10(kcat): 范围 [-6, 7] → [0, 1]
-    'kcat_min': -6.0,
-    'kcat_max': 7.0,
+    'pkd_max': 12.0,
+    # log10(kcat): 范围 [-7, 8] → [0, 1]（数据 P0.01=-6.98, P100=7.76）
+    'kcat_min': -7.0,
+    'kcat_max': 8.0,
 }
 
 
@@ -135,12 +135,10 @@ def sequence_to_embedding(seq: str, max_len: int = 1020) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────
 
 class OxidoreductaseDataset(Dataset):
-    """氧化还原酶数据集：直接加载 unified_metadata.parquet + proteins.h5。
+    """酶数据集：直接加载 unified_metadata.parquet + proteins.h5。
 
-    修复了三个关键 bug：
-      1. 序列从 proteins.h5 加载（而非 metadata 中不存在的 "sequence" 列）
-      2. struct_feat 从 proteins.h5 计算（而非始终为零）
-      3. 使用统一数据集，消除 record_idx 合并错误
+    精简版 (v2)：仅加载序列嵌入 + 配体图 + 辅因子字符串。
+    结构/口袋/域特征已从 ProteinEncoder 移除，不再加载。
     """
 
     def __init__(self,
@@ -196,11 +194,8 @@ class OxidoreductaseDataset(Dataset):
         n_with_pkd = self.df["pkd_raw"].notna().sum()
         n_with_kcat = self.df["has_kcat"].sum()
         n_with_cofactor = (self.df["cofactors"].notna() & (self.df["cofactors"] != "")).sum()
-        n_with_structure = self.df["has_structure"].sum()
-        n_with_domain = self.df["has_domain_annotation"].sum()
         log.info(f"  With pKd: {n_with_pkd}, With kcat: {n_with_kcat}, "
                  f"With cofactor: {n_with_cofactor}")
-        log.info(f"  With structure: {n_with_structure}, With domains: {n_with_domain}")
         log.info(f"  Protein encoding: {'ESM-2 (precomputed)' if use_esm2 else 'AA properties'}")
 
     @property
@@ -234,34 +229,6 @@ class OxidoreductaseDataset(Dataset):
         else:
             # AA属性路径: 6维物化特征 → ProteinEncoder.aa_proj 学习投影
             seq_embed = sequence_to_embedding(seq)  # (AA_PROP_DIM,)
-
-        # ── 结构特征（从 proteins.h5 计算） ──
-        has_structure = bool(row["has_structure"])
-        if has_structure and "contact_number" in group:
-            cn_mean = float(np.mean(group["contact_number"][:]))
-            pi_mean = float(np.mean(group["protrusion_index"][:]))
-            bs_flag = 1.0 if row["has_binding_site"] else 0.0
-            struct_feat = torch.tensor([cn_mean, pi_mean, bs_flag], dtype=torch.float32)
-        else:
-            struct_feat = torch.zeros(3)
-
-        # ── 口袋几何特征（从 proteins.h5 加载） ──
-        if "pocket_ca_distances" in group:
-            pocket_cn = torch.from_numpy(group["pocket_contact_number"][:]).float()
-            pocket_pi = torch.from_numpy(group["pocket_protrusion_index"][:]).float()
-            pocket_dist = torch.from_numpy(group["pocket_ca_distances"][:]).float()
-            pocket_mask = torch.ones(len(pocket_cn), dtype=torch.bool)
-        else:
-            pocket_cn = torch.zeros(0)
-            pocket_pi = torch.zeros(0)
-            pocket_dist = torch.zeros(0, 0)
-            pocket_mask = torch.zeros(0, dtype=torch.bool)
-
-        # ── 域掩码（从 proteins.h5 加载） ──
-        if "domain_masks" in group:
-            domain_masks = torch.from_numpy(group["domain_masks"][:]).float()
-        else:
-            domain_masks = torch.zeros(15, max(len(seq), 1))
 
         # ── 配体分子图 ──
         inchikey = row["ligand_inchikey"]
@@ -314,9 +281,6 @@ class OxidoreductaseDataset(Dataset):
         return {
             "ligand_data": ligand_data,
             "seq_embed": seq_embed,
-            "struct_feat": struct_feat,
-            "domain_masks": domain_masks,
-            "has_structure": torch.tensor(has_structure, dtype=torch.bool),
             "cofactor_str": cofactor_str,
             # ✅ 归一化后的目标值 [0, 1]，用于损失计算
             "pkd_target": torch.tensor(pkd_normalized, dtype=torch.float32),
@@ -325,10 +289,6 @@ class OxidoreductaseDataset(Dataset):
             "has_kcat": torch.tensor(has_kcat, dtype=torch.bool),
             "kcat_weight": torch.tensor(kcat_weight, dtype=torch.float32),
             "quality_weight": torch.tensor(quality_weight, dtype=torch.float32),
-            "pocket_cn": pocket_cn,
-            "pocket_pi": pocket_pi,
-            "pocket_dist": pocket_dist,
-            "pocket_mask": pocket_mask,
             # 原始值（用于评估和反归一化）
             "pkd_raw": torch.tensor(pkd_val if has_pkd else 0.0, dtype=torch.float32),
             "log_kcat_raw": torch.tensor(log_kcat_label if has_kcat else 0.0, dtype=torch.float32),
@@ -336,15 +296,12 @@ class OxidoreductaseDataset(Dataset):
 
 
 def collate_fn(batch: list[dict]) -> dict:
-    """自定义 collate：处理 PyG 图、变长 domain_masks"""
+    """自定义 collate：处理 PyG 图"""
     from torch_geometric.data import Batch as PyGBatch
 
     ligand_batch = PyGBatch.from_data_list([item["ligand_data"] for item in batch])
 
     seq_embed = torch.stack([item["seq_embed"] for item in batch])
-    struct_feat = torch.stack([item["struct_feat"] for item in batch])
-    has_structure = torch.stack([item["has_structure"] for item in batch])
-
     cofactor_strs = [item["cofactor_str"] for item in batch]
     pkd_target = torch.stack([item["pkd_target"] for item in batch])
     has_pkd = torch.stack([item["has_pkd"] for item in batch])
@@ -353,50 +310,9 @@ def collate_fn(batch: list[dict]) -> dict:
     kcat_weight = torch.stack([item["kcat_weight"] for item in batch])
     quality_weight = torch.stack([item["quality_weight"] for item in batch])
 
-    # ── pocket 特征变长 padding ──
-    pocket_cn_list = [item["pocket_cn"] for item in batch]
-    pocket_pi_list = [item["pocket_pi"] for item in batch]
-    pocket_dist_list = [item["pocket_dist"] for item in batch]
-    pocket_mask_list = [item["pocket_mask"] for item in batch]
-    max_K = max(cn.size(0) for cn in pocket_cn_list)
-    B = len(batch)
-    if max_K > 0:
-        pocket_cn_padded = torch.zeros(B, max_K)
-        pocket_pi_padded = torch.zeros(B, max_K)
-        pocket_dist_padded = torch.zeros(B, max_K, max_K)
-        pocket_mask_padded = torch.zeros(B, max_K, dtype=torch.bool)
-        for i in range(B):
-            K = pocket_cn_list[i].size(0)
-            if K > 0:
-                pocket_cn_padded[i, :K] = pocket_cn_list[i]
-                pocket_pi_padded[i, :K] = pocket_pi_list[i]
-                pocket_dist_padded[i, :K, :K] = pocket_dist_list[i]
-                pocket_mask_padded[i, :K] = pocket_mask_list[i]
-    else:
-        pocket_cn_padded = torch.zeros(B, 1)
-        pocket_pi_padded = torch.zeros(B, 1)
-        pocket_dist_padded = torch.zeros(B, 1, 1)
-        pocket_mask_padded = torch.zeros(B, 1, dtype=torch.bool)
-
-    # ── domain_masks 变长 padding ──
-    domain_masks_list = [item["domain_masks"] for item in batch]  # each (15, L_i)
-    max_len = max(dm.size(-1) for dm in domain_masks_list)
-    n_types = domain_masks_list[0].size(0)  # 15
-    padded = torch.zeros(len(batch), n_types, max_len)
-    for i, dm in enumerate(domain_masks_list):
-        padded[i, :, :dm.size(-1)] = dm
-    # padding mask: True where the position is valid (not padded)
-    domain_padding_mask = torch.zeros(len(batch), max_len, dtype=torch.bool)
-    for i, dm in enumerate(domain_masks_list):
-        domain_padding_mask[i, :dm.size(-1)] = True
-
     return {
         "ligand_data": ligand_batch,
         "seq_embed": seq_embed,
-        "struct_feat": struct_feat,
-        "domain_masks": padded,
-        "domain_padding_mask": domain_padding_mask,
-        "has_structure": has_structure,
         "cofactor_strs": cofactor_strs,
         "pkd_target": pkd_target,
         "pkd_target_mask": has_pkd,
@@ -404,10 +320,6 @@ def collate_fn(batch: list[dict]) -> dict:
         "kcat_target_mask": has_kcat,
         "kcat_weights": kcat_weight,
         "quality_weight": quality_weight,
-        "pocket_cn": pocket_cn_padded,
-        "pocket_pi": pocket_pi_padded,
-        "pocket_dist": pocket_dist_padded,
-        "pocket_mask": pocket_mask_padded,
     }
 
 
@@ -432,6 +344,7 @@ class Trainer:
                  use_amp: bool = False,
                  use_compile: bool = False,
                  grad_accum_steps: int = 1,
+                 warmup_steps: int = 1000,
                  ):
         self.device = device
         self.use_amp = use_amp and device.startswith("cuda")
@@ -455,15 +368,33 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
 
         self.global_step = 0
+        self.warmup_steps = warmup_steps
 
         if optimizer_fn is not None:
             self.optimizer = optimizer_fn(model, lr=lr, weight_decay=weight_decay)
         else:
             self.optimizer = create_trenzition_optimizer(model, lr=lr, weight_decay=weight_decay)
 
-        self.scheduler = CosineAnnealingWarmRestarts(
+        # ── Scheduler: warmup + CosineAnnealingWarmRestarts ──
+        base_scheduler = CosineAnnealingWarmRestarts(
             self.optimizer, T_0=5000, T_mult=2,
         )
+        if warmup_steps > 0:
+            from torch.optim.lr_scheduler import LinearLR, SequentialLR
+            warmup_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=1e-6,    # 从几乎 0 开始
+                end_factor=1.0,        # 线性升至原始 LR
+                total_iters=warmup_steps,
+            )
+            self.scheduler = SequentialLR(
+                self.optimizer,
+                [warmup_scheduler, base_scheduler],
+                milestones=[warmup_steps],
+            )
+            log.info(f"Warmup: {warmup_steps} steps linear increase → CosineAnnealingWarmRestarts")
+        else:
+            self.scheduler = base_scheduler
 
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -499,14 +430,6 @@ class Trainer:
                     batch_gpu["ligand_data"],
                     batch_gpu["seq_embed"],
                     batch_gpu["cofactor_strs"],
-                    batch_gpu["struct_feat"],
-                    batch_gpu["has_structure"],
-                    domain_masks=batch_gpu.get("domain_masks"),
-                    domain_padding_mask=batch_gpu.get("domain_padding_mask"),
-                    pocket_cn=batch_gpu.get("pocket_cn"),
-                    pocket_pi=batch_gpu.get("pocket_pi"),
-                    pocket_dist=batch_gpu.get("pocket_dist"),
-                    pocket_mask=batch_gpu.get("pocket_mask"),
                 )
 
                 # 损失
@@ -578,14 +501,6 @@ class Trainer:
                 batch_gpu["ligand_data"],
                 batch_gpu["seq_embed"],
                 batch_gpu["cofactor_strs"],
-                batch_gpu["struct_feat"],
-                batch_gpu["has_structure"],
-                domain_masks=batch_gpu.get("domain_masks"),
-                domain_padding_mask=batch_gpu.get("domain_padding_mask"),
-                pocket_cn=batch_gpu.get("pocket_cn"),
-                pocket_pi=batch_gpu.get("pocket_pi"),
-                pocket_dist=batch_gpu.get("pocket_dist"),
-                pocket_mask=batch_gpu.get("pocket_mask"),
             )
 
             total_loss, losses = self.model.compute_loss(
@@ -705,14 +620,6 @@ class Trainer:
                 batch_gpu["ligand_data"],
                 batch_gpu["seq_embed"],
                 batch_gpu["cofactor_strs"],
-                batch_gpu["struct_feat"],
-                batch_gpu["has_structure"],
-                domain_masks=batch_gpu.get("domain_masks"),
-                domain_padding_mask=batch_gpu.get("domain_padding_mask"),
-                pocket_cn=batch_gpu.get("pocket_cn"),
-                pocket_pi=batch_gpu.get("pocket_pi"),
-                pocket_dist=batch_gpu.get("pocket_dist"),
-                pocket_mask=batch_gpu.get("pocket_mask"),
             )
             _, losses = self.model.compute_loss(
                 outputs,
@@ -770,6 +677,8 @@ def main():
                         help="Enable torch.compile (PyTorch ≥ 2.0, ~30%% speedup on GPU)")
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Gradient accumulation steps (effective batch = batch_size × grad_accum)")
+    parser.add_argument("--warmup-steps", type=int, default=1000,
+                        help="Linear LR warmup steps (0=disable)")
     parser.add_argument("--no-esm2", action="store_true",
                         help="Use AA properties instead of ESM-2 (default: ESM-2)")
     # 检查点
@@ -841,6 +750,7 @@ def main():
         use_amp=args.amp,
         use_compile=args.compile,
         grad_accum_steps=args.grad_accum,
+        warmup_steps=args.warmup_steps,
     )
 
     if args.resume:

@@ -1,164 +1,300 @@
-# AI4enz — Enzyme Mining and Activity Prediction
+# AI4enz — 基于过渡态理论的酶-底物结合预测
 
-基于过渡态理论的酶-底物结合亲和力（pKd）与催化效率（kcat/KM）预测模型。
+利用深度学习预测酶-底物结合亲和力 (pKd) 和催化效率 (log₁₀(kcat))，服务于 **"给定目标底物 → 推荐最优酶序列"** 的酶挖掘场景。
 
-## Quick Start
+---
+
+## 🚀 快速开始 — 训练
 
 ```bash
+# 1. 激活环境
 source /home/domi/BINN/.venv/bin/activate
+
+# 2. 直接训练（默认参数使用 trenzition V5 数据集）
 cd /home/domi/AI4enz/dataset_building/models
 
-# 快速验证 (CPU)
-python train.py --unified-metadata ../processed/metadata.parquet \
-  --proteins-h5 ../processed/proteins.h5 \
-  --ligand-dir ../processed/ligands \
-  --epochs 10 --batch-size 32 --max-samples 5000 --device cpu
+# 快速验证（10 分钟）
+python train.py --epochs 5 --batch-size 32 --max-samples 2000 --device cpu --num-workers 0
 
-# 完整训练 (CPU)
-python train.py --unified-metadata ../processed/metadata.parquet \
-  --proteins-h5 ../processed/proteins.h5 \
-  --ligand-dir ../processed/ligands \
-  --epochs 100 --batch-size 128 --device cpu
+# 完整训练（CPU, ~3 天）
+python train.py --epochs 100 --batch-size 128 --device cpu --num-workers 2
+
+# GPU 全优化（推荐，~1-2 小时）
+python train.py --epochs 100 --batch-size 256 --device cuda --num-workers 8 --amp --compile
 ```
 
-## Architecture
+> 所有训练参数都有默认值，指定 `--unified-metadata` / `--proteins-h5` / `--ligand-dir` 可切换数据集。
 
-**TransitionBINN** — Hybrid 双路径设计：
-- **pKd 路径**：Ligand GNN + Protein (ESM-2 + 口袋结构) + Cofactor → pKd [0,1]
-- **kcat 路径**：Protein ESM-2 + Cofactor → log₁₀(kcat) [0,1]
-- **Score**：pKd + log_kcat = log₁₀(kcat/KM)
+### 训练参数说明
 
-### 核心创新
-- **过渡态理论**：替代Marcus方程，普适所有酶催化反应
-- **Neural ODE**：模拟反应坐标 ξ∈[0,1] 演化
-- **门控机制**：模拟"跨越能垒"过程
-- **GeLU激活**：与ESM-2一致，梯度更流畅
+| 参数 | 默认值 | 作用 |
+|------|--------|------|
+| `--epochs` | 100 | 训练轮数 |
+| `--batch-size` | 128 | 每步样本数（GPU 可设 256） |
+| `--lr` | 1e-4 | 基础学习率 |
+| `--warmup-steps` | 1000 | LR 预热步数（0 可关闭） |
+| `--device` | auto | `cpu` 或 `cuda` |
+| `--num-workers` | 4 | 数据加载并行数（CPU 用 0-2） |
+| `--amp` | off | 混合精度加速（仅 CUDA） |
+| `--compile` | off | torch.compile 加速（需 PyTorch ≥ 2.0） |
+| `--grad-accum` | 1 | 梯度累积步数（小显存用） |
+| `--max-samples` | ∞ | 限制样本数（调试用） |
+
+---
+
+## 📊 训练策略
+
+Trenzition 模型采用一套完整的训练策略，在 `train.py` + `ranking_model.py` 中实现：
+
+### 优化器：AdamW + 分组学习率
+
+不同组件使用不同学习率，基于各自的学习需求：
+
+```
+Encoder（蛋白/配体/辅因子）:  lr × 1.0  = 1e-4  ← 正常学习
+BINN（ODE 动力学）:          lr × 0.5  = 5e-5  ← 保守，防 ODE 不稳定
+Head（3 个输出头）:          lr × 2.0  = 2e-4  ← 快速收敛
+可学习 Loss 权重:            lr × 0.1  = 1e-5  ← 慢调（默认关闭）
+```
+
+### 学习率调度：Warmup → CosineAnnealingWarmRestarts
+
+```
+LR
+↑
+│         ╱╲      ╱╲      ╱╲
+│        ╱  ╲    ╱  ╲    ╱  ╲
+│       ╱    ╲  ╱    ╲  ╱    ╲
+│      ╱      ╲╱      ╲╱      ╲
+│  ━━╱                        ╲
+│ ╱
+│╱
+└───────────────────────────────→ Steps
+   ↑ warmup      T₀=5000    T₁=10000
+   1000 steps    余弦退火    周期倍增
+```
+
+- **Warmup**：前 1000 步 LR 从 ≈0 线性升至目标值，防止初始 loss 爆炸
+- **CosineAnnealingWarmRestarts**：T₀=5000 steps，T_mult=2，周期余弦退火，帮助跳出局部最优
+
+### 梯度裁剪：max_norm=1.0
+
+所有梯度裁剪到最大 L2 范数 1.0，防止梯度爆炸（尤其是 BINN ODE 路径）。
 
 ### 损失函数
+
 ```python
-L_total = L_ts + L_catalysis + 0.1*L_barrier + 0.01*L_progress
-# 权重1:1配平（Min-Max归一化后量级一致）
+L_total = L_ts + L_catalysis + 0.01 × L_eyring
+
+# L_ts: 结合亲和力（pKd）—— SmoothL1，归一化目标 [0,1]
+# L_catalysis: 催化效率（log₁₀(kcat)）—— SmoothL1，归一化目标 [0,1]
+# L_eyring: Eyring 方程自洽约束 —— MSE，不依赖标签
 ```
 
-## Dataset — trenzition V5
+缺失标签处理：`pkd_target_mask` / `kcat_target_mask` 在 loss 计算中自动 mask 掉缺失值，单标签样本仍贡献共享编码器梯度。
 
-| Metric | Value |
-|--------|-------|
-| 总样本 | **98,506** |
-| pKd样本 | 72,361 (73.5%) |
-| kcat样本 | 93,652 (95.1%) |
-| **双标签样本** | **67,507 (68.5%)** |
-| EC号样本 | 98,506 (100%) |
-| 唯一蛋白 | 19,278 |
-| 唯一配体 | 7,273 |
+### 参数初始化
 
-### Split分布（蛋白层级，零泄漏）
+针对非 ReLU 激活（GELU、SiLU）和 sigmoid 输出头的特性设计的初始化策略：
 
-| Split | 样本数 | 蛋白数 | pKd | kcat |
-|-------|--------|--------|-----|------|
-| train | 69,738 | 13,494 | 51,466 | 66,280 |
-| val | 13,956 | 2,892 | 10,288 | 13,233 |
-| test | 14,812 | 2,892 | 10,607 | 14,139 |
+| 层级 | 初始化 | 原因 |
+|------|--------|------|
+| 输出头最后一层 `Linear(64,1)` → sigmoid | Xavier gain=**0.3** | 防 sigmoid 初始饱和 |
+| BINN ODE 动力学层 | Xavier gain=**0.67** | 防多步积分放大 |
+| 其他所有 Linear | Xavier gain=**1.0** | 标准 Xavier |
+| LayerNorm | 保持默认 (1.0, 0.0) | |
+
+---
+
+## 📦 数据集 — trenzition V5
+
+### 全局统计
+
+| 指标 | 值 |
+|------|-----|
+| 总记录 | **97,351** |
+| pKd 有效 | 71,482 (73.4%) |
+| kcat 有效 | 92,743 (95.3%) |
+| 双标签 (pKd + kcat) | 66,874 (68.7%) |
+| EC 号覆盖 | 97,351 (100%) |
+| 唯一蛋白 | 19,223 |
+| 唯一配体 (InChIKey) | 7,249 |
+
+### 数据来源
+
+| 来源 | 期刊 | 数据 |
+|------|------|------|
+| CatPred-DB | Nature Comms 2025 | kcat, Ki |
+| OED | NAR 2025 | kcat, Km, kcat/Km |
+| SKiD | Scientific Data 2025 | kcat, Km + 3D 结构 |
+| BindingDB | 月度更新 | Kd, Ki |
+
+### Split 分布（蛋白层级，零泄漏）
+
+| Split | 样本数 | 蛋白数 | pKd 有效 | kcat 有效 |
+|-------|--------|--------|----------|-----------|
+| train | 68,876 | 13,454 | 50,804 | 68,876 |
+| val | 13,801 | 2,885 | 10,176 | 13,801 |
+| test | 14,674 | 2,884 | 10,502 | 14,674 |
 
 ### 编码状态
 
-| 组件 | 覆盖率 | 方式 |
-|------|--------|------|
-| 蛋白 | 19,278/19,278 (100%) | ESM-2 (esm2_t33_650M, 1280-dim) |
-| 配体 | 7,273/7,278 (99.9%) | GNN (GATv2, 79-dim atom + 10-dim bond) |
-| 无机离子 | 5 种不可编码 → 已剔除 | Ag⁺, Co, S, NO, Na⁺ |
+| 组件 | 覆盖率 | 编码方式 |
+|------|--------|----------|
+| 蛋白 ESM-2 | 19,223/19,223 (100%) | esm2_t33_650M, 1280-dim mean-pool |
+| 配体 GNN | 7,249/7,249 (100%) | GATv2×3, 79-dim 原子特征 |
+| 辅因子 | 57.8% 非空 | 310 种组合，可学习 Embedding |
 
-### 数据来源
-- CatPred-DB (Nature Comms 2025): kcat, Ki
-- OED (NAR 2025): kcat, Km, kcat/Km
-- SKiD (Scientific Data 2025): kcat, Km + 3D结构
-- BindingDB: Kd, Ki
+### 测量类型分布
 
-## 测量类型
+| 类型 | 数量 | 可信度 | Loss 权重 |
+|------|------|--------|-----------|
+| Ki | 59,883 | 中-高 | 0.70 |
+| Kd | 37,219 | 高 | 1.00 |
+| IC50_approx | 249 | 低 | 0.15 |
 
-| 类型 | 数量 | 可信度 | 权重 |
-|------|------|--------|------|
-| Ki | 60,758 | 中-高 | 0.7 |
-| Kd | 37,499 | 高 | 1.0 |
-| IC50_approx | 249 | 低-中 | 0.4 |
+### Min-Max 归一化
 
-## GPU 训练
+| 目标 | 原始范围 | 归一化到 | 依据 |
+|------|----------|----------|------|
+| pKd | [0, 12] | [0, 1] | P99.9=10.32，留余量 |
+| log₁₀(kcat) | [-7, 8] | [0, 1] | P0.01=-6.98, P100=7.76 |
 
-### 环境配置
+---
+
+## 🏗 模型架构
+
+```
+输入: 蛋白序列 + 配体分子 + 辅因子
+         │
+    ┌────┴────┐
+    │ 编码器层 │
+    │ ─────── │
+    │ Ligand  │  GATv2×3 GNN (79-dim → 256)
+    │ Protein │  ESM-2 直通 + LayerNorm (1280 → 256)
+    │ Cofactor│  Embedding lookup (310 types → 64)
+    └────┬────┘
+         │
+    ┌────┴────┐
+    │  BINN   │  LatentPathwayBINN
+    │ ─────── │  Neural ODE, 5 步积分
+    │ ξ→ξ+Δξ │  门控机制模拟"跨越能垒"
+    │   ↻ ×5  │  GELU 激活
+    └────┬────┘
+         │
+    ┌────┴──────────────┐
+    │   TrenzitionCatalysisHead    │
+    │ ────────────────── │
+    │ ts_stability   [0,1]│  sigmoid → pKd
+    │ catalysis_rate [0,1]│  sigmoid → log₁₀(kcat)
+    │ dG_eyring  [20,200]│  sigmoid-scaling → ΔG‡ (kJ/mol)
+    └────────────────────┘
+```
+
+### 设计亮点
+
+- **过渡态理论**（普适所有酶催化）
+- **反应坐标 ODE**（Neural ODE 模拟 ξ∈[0,1] 演化）
+- **Hybrid 双路径**（pKd 路径 + kcat 独立路径）
+- **Eyring 自洽约束**（两个输出头的物理一致性）
+
+---
+
+## 📁 项目结构
+
+```
+AI4enz/
+├── dataset_building/
+│   ├── models/               ← 模型定义 + 训练入口
+│   │   ├── train.py           ← 训练脚本
+│   │   ├── ranking_model.py   ← Trenzition 模型定义
+│   │   ├── classification_head.py
+│   │   ├── checkpoints/       ← 训练输出
+│   │   └── __init__.py
+│   ├── processed/
+│   │   ├── metadata.parquet   ← 统一元数据（97,351 条）
+│   │   ├── proteins.h5        ← ESM-2 嵌入（53,133 蛋白）
+│   │   └── ligands/           ← 配体 GNN 图（7,249 个 .pt）
+│   ├── pipeline/              ← 数据处理流水线
+│   ├── scripts/               ← 爬虫与特征工程
+│   ├── BindingDB/  BRENDA/  OED/  SKiD/  ...  ← 原始数据
+│   └── release/               ← 旧版本发布
+├── README.md
+└── CLAUDE.md
+```
+
+---
+
+## ⚙️ 环境配置
 
 ```bash
-# 1. CUDA Toolkit (建议 ≥ 12.1)
-nvidia-smi                          # 确认 GPU 驱动可用
+# 推荐：使用项目已有环境
+source /home/domi/BINN/.venv/bin/activate
 
-# 2. 创建虚拟环境 (Python ≥ 3.10)
+# 或者从头创建
 python -m venv .venv
 source .venv/bin/activate
 
-# 3. PyTorch + CUDA
+# PyTorch (CPU)
+pip install torch torchvision torchaudio
+
+# PyTorch (CUDA 12.1)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# 4. PyTorch Geometric (匹配 PyTorch 版本)
+# PyTorch Geometric
 pip install torch_geometric
 pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
   -f https://data.pyg.org/whl/torch-2.0.0+cu121.html
 
-# 5. 其他依赖
+# 其他依赖
 pip install rdkit h5py pandas numpy tqdm transformers fair-esm
 ```
 
-### 训练命令
+---
 
-```bash
-cd dataset_building/models
+## ⏱ 性能估算
 
-# === 基础 GPU 训练 ===
-python train.py --epochs 100 --batch-size 128 --device cuda
+| 硬件 | batch_size | ~时间/epoch | 100 epochs | 命令 |
+|------|-----------|-------------|------------|------|
+| CPU (i7, WSL2) | 128 | ~45 min | ~3 天 | `--device cpu --num-workers 2` |
+| RTX 3060 (12GB) | 64+ga2 | ~5 min | ~8 h | `--amp --grad-accum 2` |
+| RTX 3090 (24GB) | 128 | ~2 min | ~3.5 h | `--amp` |
+| RTX 4090 (24GB) | 256 | ~1 min | ~1.7 h | `--amp --compile` |
+| A100 (40GB) | 512 | ~30 s | ~50 min | `--amp --compile` |
 
-# === GPU 全优化（推荐） ===
-python train.py \
-  --epochs 100 --batch-size 256 \
-  --device cuda --num-workers 8 \
-  --amp --compile --grad-accum 1
+---
 
-# === 显存不足时 (VRAM < 16GB) ===
-python train.py \
-  --epochs 100 --batch-size 64 \
-  --device cuda --num-workers 4 \
-  --amp --grad-accum 2
+## 📊 损失曲线解读
+
+训练过程中日志格式：
+
+```
+Epoch  10/100 | train: 0.5234  val: 0.4981  (best: 0.4876) | L_ts: 0.0312  L_cat: 0.0254  L_barrier: 0.0000
 ```
 
-### GPU 参数说明
+- **train/val loss** 稳步下降 → 正常
+- **val loss >> train loss** → 过拟合（减小 epoch 或增加正则化）
+- **train loss 不降** → LR 太小或数据问题
+- **L_barrier 始终=0** → 正常（此项已移除，保留为 0）
 
-| 参数 | 作用 | 建议值 |
-|------|------|--------|
-| `--device cuda` | 使用 GPU 训练 | — |
-| `--amp` | 自动混合精度，~2× 加速，显存减半 | 始终开启 |
-| `--compile` | torch.compile，~30% 加速 (PyTorch ≥ 2.0) | 首次编译慢，后续生效 |
-| `--grad-accum N` | 梯度累积，等效 batch = batch_size × N | VRAM 不足时用 |
-| `--num-workers N` | DataLoader 并行加载 | GPU: 4-8, CPU: 2-4 |
-| `--batch-size N` | 每步样本数 | 大显存: 256, 小显存: 64 |
+---
 
-### 性能估算
+## 🔄 断点续训
 
-| 硬件 | batch_size | ~时间/epoch | 100 epochs |
-|------|-----------|-------------|------------|
-| CPU (i7) | 128 | ~40 min | ~67 h |
-| RTX 3090 (24GB) | 128 | ~2 min | ~3.5 h |
-| RTX 4090 (24GB) | 256 | ~1 min | ~1.7 h |
-| A100 (40GB) | 512 | ~30 s | ~50 min |
-| RTX 3060 (12GB) | 64 + grad_accum 2 | ~5 min | ~8 h |
+```bash
+python train.py --resume checkpoints/last.ckpt
+```
 
-## Requirements
+自动恢复：模型权重、优化器状态、scheduler 状态、AMP scaler、global_step。
 
-- PyTorch ≥ 2.0 + PyTorch Geometric
-- ESM-2 (esm2_t33_650M_UR50D)
-- RDKit
-- h5py
-- **GPU 训练**: CUDA Toolkit ≥ 12.1, NVIDIA 驱动 ≥ 525
+---
 
-## 最新更新 (2026-06-11)
+## 📝 最新更新 (2026-06-12)
 
-- ✅ ESM-2 蛋白编码完成：19,278 个蛋白，366 min (CPU)
-- ✅ 配体 GNN 编码完成：7,273 个配体，5 个无机离子剔除
-- ✅ 训练管线验证通过：端到端 forward + backward + loss，2 epochs
-- ✅ GPU 训练支持：AMP 混合精度 + torch.compile + 梯度累积
+- ✅ ESM-2 蛋白编码完成：19,223 蛋白（100%）
+- ✅ 配体 GNN 编码完成：7,249 配体（100%）
+- ✅ 端到端训练验证通过
+- ✅ 归一化参数调整（pKd: [0,12], kcat: [-7,8]）
+- ✅ 添加 LR warmup（默认 1000 steps）
+- ✅ 参数初始化优化（防 sigmoid 饱和 + ODE 稳定）
+- ✅ 清理旧版配体文件（移除 541k 冗余文件，释放 5.6 GB）
