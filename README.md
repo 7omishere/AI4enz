@@ -39,63 +39,30 @@ python train.py --epochs 100 --batch-size 256 --device cuda --num-workers 8 --am
 | `--compile` | off | torch.compile 加速（需 PyTorch ≥ 2.0） |
 | `--grad-accum` | 1 | 梯度累积步数（小显存用） |
 | `--max-samples` | ∞ | 限制样本数（调试用） |
+| `--finetune` | None | 从已有 .ckpt 加载权重微调 |
+| `--gate-weight` | 0.02 | Gate 正则化强度（0=关闭，负样本训练用） |
 
 ---
 
 ## 📊 训练策略
 
-Trenzition 模型采用一套完整的训练策略，在 `train.py` + `ranking_model.py` 中实现：
-
 ### 优化器：AdamW + 分组学习率
 
-不同组件使用不同学习率，基于各自的学习需求：
-
-```
-Encoder（蛋白/配体/辅因子）:  lr × 1.0  = 1e-4  ← 正常学习
-BINN（ODE 动力学）:          lr × 0.5  = 5e-5  ← 保守，防 ODE 不稳定
-Head（3 个输出头）:          lr × 2.0  = 2e-4  ← 快速收敛
-可学习 Loss 权重:            lr × 0.1  = 1e-5  ← 慢调（默认关闭）
-```
+| 参数组 | LR 倍率 | 说明 |
+|--------|---------|------|
+| Encoder（蛋白/配体/辅因子） | ×1.0 | 正常学习 |
+| BINN（动力学 + Gate） | ×0.5 | 保守，防不稳定 |
+| Head（输出头） | ×2.0 | 快速收敛 |
 
 ### 学习率调度：Warmup → CosineAnnealingWarmRestarts
 
-```
-LR
-↑
-│         ╱╲      ╱╲      ╱╲
-│        ╱  ╲    ╱  ╲    ╱  ╲
-│       ╱    ╲  ╱    ╲  ╱    ╲
-│      ╱      ╲╱      ╲╱      ╲
-│  ━━╱                        ╲
-│ ╱
-│╱
-└───────────────────────────────→ Steps
-   ↑ warmup      T₀=5000    T₁=10000
-   1000 steps    余弦退火    周期倍增
-```
-
-- **Warmup**：前 1000 步 LR 从 ≈0 线性升至目标值，防止初始 loss 爆炸
-- **CosineAnnealingWarmRestarts**：T₀=5000 steps，T_mult=2，周期余弦退火，帮助跳出局部最优
+前 1000 步 LR 从 ≈0 线性升至目标值，之后 T₀=5000 余弦退火（T_mult=2 周期倍增）。
 
 ### 梯度裁剪：max_norm=1.0
 
-所有梯度裁剪到最大 L2 范数 1.0，防止梯度爆炸（尤其是 BINN ODE 路径）。
-
-### 损失函数
-
-```python
-L_total = L_ts + L_catalysis + 0.01 × L_eyring
-
-# L_ts: 结合亲和力（pKd）—— SmoothL1，归一化目标 [0,1]
-# L_catalysis: 催化效率（log₁₀(kcat)）—— SmoothL1，归一化目标 [0,1]
-# L_eyring: Eyring 方程自洽约束 —— MSE，不依赖标签
-```
-
-缺失标签处理：`pkd_target_mask` / `kcat_target_mask` 在 loss 计算中自动 mask 掉缺失值，单标签样本仍贡献共享编码器梯度。
+所有梯度裁剪到最大 L2 范数 1.0，防止 BINN 路径梯度爆炸。
 
 ### 参数初始化
-
-针对非 ReLU 激活（GELU、SiLU）和 sigmoid 输出头的特性设计的初始化策略：
 
 | 层级 | 初始化 | 原因 |
 |------|--------|------|
@@ -145,14 +112,6 @@ L_total = L_ts + L_catalysis + 0.01 × L_eyring
 | 配体 GNN | 7,249/7,249 (100%) | GATv2×3, 79-dim 原子特征 |
 | 辅因子 | 57.8% 非空 | 310 种组合，可学习 Embedding |
 
-### 测量类型分布
-
-| 类型 | 数量 | 可信度 | Loss 权重 |
-|------|------|--------|-----------|
-| Ki | 59,883 | 中-高 | 0.70 |
-| Kd | 37,219 | 高 | 1.00 |
-| IC50_approx | 249 | 低 | 0.15 |
-
 ### Min-Max 归一化
 
 | 目标 | 原始范围 | 归一化到 | 依据 |
@@ -171,32 +130,76 @@ L_total = L_ts + L_catalysis + 0.01 × L_eyring
     │ 编码器层 │
     │ ─────── │
     │ Ligand  │  GATv2×3 GNN (79-dim → 256)
-    │ Protein │  ESM-2 直通 + LayerNorm (1280 → 256)
-    │ Cofactor│  Embedding lookup (310 types → 64)
-    └────┬────┘
-         │
-    ┌────┴────┐
-    │  BINN   │  LatentPathwayBINN
-    │ ─────── │  Neural ODE, 5 步积分
-    │ ξ→ξ+Δξ │  门控机制模拟"跨越能垒"
-    │   ↻ ×5  │  GELU 激活
+    │ Protein │  ESM-2 直通 (1280 → 256)
+    │ Cofactor│  Embedding (310 types → 64 → 256)
     └────┬────┘
          │
     ┌────┴──────────────┐
-    │   TrenzitionCatalysisHead    │
-    │ ────────────────── │
-    │ ts_stability   [0,1]│  sigmoid → pKd
-    │ catalysis_rate [0,1]│  sigmoid → log₁₀(kcat)
-    │ dG_eyring  [20,200]│  sigmoid-scaling → ΔG‡ (kJ/mol)
-    └────────────────────┘
+    │  LatentPathwayBINN │
+    │ ───────────────── │
+    │ h₀ = MLP(pro, lig) │  酶-底物复合物初始状态
+    │                     │
+    │ dh = dynamics(h)   │  特征变换
+    │ dh *= gate         │  ← Gate 控制信息流 [0,1]
+    │ h = h₀ + (dh+dh_c)/2 │  中点Euler积分 (1步)
+    └────┬──────────────┘
+         │
+    ┌────┴──────────────────┐
+    │ TrenzitionCatalysisHead│
+    │ ────────────────────── │
+    │ ts_stability   [0,1]   │  sigmoid → pKd
+    │ catalysis_rate [0,1]   │  sigmoid → log₁₀(kcat)
+    │ dG_eyring  [20,200]    │  ΔG‡ (kJ/mol)
+    └────────────────────────┘
 ```
 
-### 设计亮点
+### Gate 门控机制
 
-- **过渡态理论**（普适所有酶催化）
-- **反应坐标 ODE**（Neural ODE 模拟 ξ∈[0,1] 演化）
-- **Hybrid 双路径**（pKd 路径 + kcat 独立路径）
-- **Eyring 自洽约束**（两个输出头的物理一致性）
+Gate ∈ [0,1] 是一个可学习的**酶-底物兼容性分类器**，回答最基本的问题："这个酶和底物之间是否存在有意义的相互作用？"
+
+**推理流程**：
+```
+输入 (酶序列, 底物SMILES)
+    │
+    ▼
+Gate 判断: "这个配对合理吗？"
+    │
+    ├─ gate ≈ 0 → "不合理，动力学阻断" → 预测值不可信
+    │
+    └─ gate ≈ 1 → "合理，动力学全开" → pKd + kcat → 排序推荐
+```
+
+**实用价值**：两阶段酶挖掘筛选
+1. **Stage 1 (Gate 过滤)**：从候选酶池中筛掉明显不反应的配对
+2. **Stage 2 (催化效率)**：对通过筛选的配对预测 pKd/kcat 并排序
+
+**注意**：Gate 不是物理能垒（ΔG‡ 由 `dG_eyring` 预测），而是数据驱动的特异性判断。其可靠性取决于负样本质量——跨 EC 负采样学到的边界比随机负采样更有意义。
+
+---
+
+## 📐 损失函数
+
+```python
+L_total = L_ts + L_catalysis + 0.01 × L_eyring + gate_weight × L_gate
+
+# ── 正样本（真实酶-底物对）──
+L_ts:        SmoothL1(ts_stability, pkd_target)        # 仅 pKd 有效时
+L_catalysis: SmoothL1(catalysis_rate, log_kcat_target) # 仅 kcat 有效时
+L_eyring:    MSE(dG_pred, dG_from_kcat)                # 仅 kcat 有效时
+L_gate:      (1 - gate)²                               # 推 gate → 1
+
+# ── 负样本（跨 EC 随机配对）──
+L_gate:      gate²   ← 负样本唯一梯度来源（其他 loss 自动 mask 掉）
+```
+
+| Loss 项 | 正样本 | 负样本 | 物理意义 |
+|---------|--------|--------|----------|
+| L_ts | ✅ | ❌ (mask) | 结合亲和力回归 |
+| L_catalysis | ✅ | ❌ (mask) | 催化效率回归 |
+| L_eyring | ✅ (仅kcat) | ❌ | 热力学自洽约束 |
+| L_gate | → 1 | → 0 | 酶-底物兼容性 |
+
+缺失标签通过 `pkd_target_mask` / `kcat_target_mask` 自动跳过，单标签样本仍贡献共享编码器梯度。
 
 ---
 
@@ -264,21 +267,6 @@ pip install rdkit h5py pandas numpy tqdm transformers fair-esm
 
 ---
 
-## 📊 损失曲线解读
-
-训练过程中日志格式：
-
-```
-Epoch  10/100 | train: 0.5234  val: 0.4981  (best: 0.4876) | L_ts: 0.0312  L_cat: 0.0254  L_barrier: 0.0000
-```
-
-- **train/val loss** 稳步下降 → 正常
-- **val loss >> train loss** → 过拟合（减小 epoch 或增加正则化）
-- **train loss 不降** → LR 太小或数据问题
-- **L_barrier 始终=0** → 正常（此项已移除，保留为 0）
-
----
-
 ## 🔄 断点续训
 
 ```bash
@@ -289,9 +277,9 @@ python train.py --resume checkpoints/last.ckpt
 
 ---
 
-## 🧪 负样本训练 (2026-06-13)
+## 🧪 负样本训练
 
-Trenzition 支持跨 EC 大类负采样，让模型学习区分「能反应的酶-底物对」和「不能反应的酶-底物对」。
+Trenzition 支持跨 EC 大类负采样，让 Gate 学会区分「能反应的酶-底物对」和「不能反应的酶-底物对」。
 
 ### 生成负样本
 
@@ -318,27 +306,161 @@ python train.py \
   --device cuda --num-workers 8 --amp --compile
 ```
 
-| 新参数 | 默认值 | 说明 |
-|--------|--------|------|
-| `--finetune` | None | 从已有 .ckpt 加载权重微调 |
-| `--gate-weight` | 0.02 | Gate 正则化强度（0=关闭） |
-
 ### Gate 正则化
 
 ```
-L_gate = 0.02 × [mean((1-gate_pos)²) + mean(gate_neg²)]
+L_gate = gate_weight × [mean((1-gate_pos)²) + mean(gate_neg²)]
 
-正样本: gate → 1  (完全信息流通)
-负样本: gate → 0  (阻挡信息)
+正样本: gate → 1  (完全信息流通，动力学全开)
+负样本: gate → 0  (完全阻断动力学，预测值不可信)
 ```
+
+**设计要点（2026-06-14 修复）**：
+- Gate 值不 detach → L_gate 梯度完整回传 Gate 网络
+- 中点校正项 `dh_correction` 也被 Gate 控制 → gate=0 时完全阻断
+- Eyring loss 仅对 kcat 标签样本计算 → 负样本不参与
 
 ---
 
-## 📝 最新更新 (2026-06-13)
+## 📊 损失曲线解读
 
+训练过程中日志格式：
+
+```
+Epoch  10/100 | train: 0.5234  val: 0.4981  (best: 0.4876) | L_ts: 0.0312  L_cat: 0.0254  L_barrier: 0.0000
+```
+
+| 观察 | 含义 |
+|------|------|
+| train/val loss 稳步下降 | 正常 |
+| val loss >> train loss | 过拟合 |
+| train loss 不降 | LR 太小或数据问题 |
+| L_gate > 0 | Gate 正在学习区分正负样本 |
+| L_gate → 0 | Gate 已收敛或 gate_weight 太小 |
+
+---
+
+## 👥 协作训练指南
+
+### 发送给朋友的文件清单
+
+```
+朋友需要以下文件放在 AI4enz/ 目录下：
+
+1. dataset_building/processed/metadata_with_negatives.parquet  (~50 MB, gitignored)
+   — 含负样本的完整元数据 (194k 样本, 1:1 pos:neg)
+
+2. dataset_building/processed/proteins.h5  (~2 GB)
+   — ESM-2 预计算嵌入 (1280-dim)
+
+3. dataset_building/processed/ligands/  (~80 MB, 7,249 个 .pt 文件)
+   — 配体分子图 (GNN 输入)
+
+4. dataset_building/models/checkpoints/best.ckpt  (~25 MB, gitignored)
+   — 预训练权重 (epoch 81, val_loss=0.0056)
+```
+
+### 朋友环境搭建
+
+```bash
+# 1. Clone 项目
+git clone <repo_url>
+cd AI4enz
+
+# 2. 解压数据文件到对应位置
+tar xzf training_data.tar.gz
+
+# 3. 放置 best.ckpt
+mkdir -p dataset_building/models/checkpoints
+cp /path/to/best.ckpt dataset_building/models/checkpoints/
+
+# 4. 创建虚拟环境
+python -m venv .venv
+source .venv/bin/activate
+
+# 5. 安装依赖
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install torch_geometric
+pip install pyg_lib torch_scatter torch_sparse torch_cluster \
+  -f https://data.pyg.org/whl/torch-2.5.0+cu121.html
+pip install rdkit h5py pandas numpy tqdm
+
+# 6. 验证数据完整性
+python -c "
+import pandas as pd
+df = pd.read_parquet('dataset_building/processed/metadata_with_negatives.parquet')
+print(f'样本数: {len(df):,}')
+print(f'正样本: {(~df.is_negative).sum():,}')
+print(f'负样本: {df.is_negative.sum():,}')
+print(f'Columns: {list(df.columns)}')
+"
+```
+
+### 朋友微调命令
+
+```bash
+cd AI4enz/dataset_building/models
+
+# 标准微调（推荐）
+python train.py \
+  --unified-metadata ../processed/metadata_with_negatives.parquet \
+  --finetune checkpoints/best.ckpt \
+  --epochs 50 --batch-size 256 --lr 5e-5 \
+  --gate-weight 0.02 \
+  --device cuda --num-workers 8 --amp --compile
+
+# 小显存版本（< 16GB）
+python train.py \
+  --unified-metadata ../processed/metadata_with_negatives.parquet \
+  --finetune checkpoints/best.ckpt \
+  --epochs 50 --batch-size 64 --lr 5e-5 \
+  --gate-weight 0.02 \
+  --device cuda --num-workers 4 --amp --grad-accum 4
+
+# CPU 版（慢，仅验证用）
+python train.py \
+  --unified-metadata ../processed/metadata_with_negatives.parquet \
+  --finetune checkpoints/best.ckpt \
+  --epochs 5 --batch-size 32 --max-samples 2000 \
+  --gate-weight 0.02 \
+  --device cpu --num-workers 2
+```
+
+### 微调后检查
+
+```python
+import torch
+from ranking_model import Trenzition
+
+ckpt = torch.load('checkpoints/best.ckpt', map_location='cpu', weights_only=False)
+model = Trenzition()
+state = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model_state_dict'].items()}
+model.load_state_dict(state, strict=False)
+model.eval()
+
+# 用 evaluate_model.py 做完整评估
+# python ../evaluation/evaluate_model.py --checkpoint checkpoints/best.ckpt
+```
+
+关注指标：
+- **Gate 分布**：正样本 gate 应集中在 0.7-1.0，负样本 gate 应集中在 0-0.3
+- **pKd/kcat 回归**：Spearman ρ 不应显著下降
+- **L_gate**：应从高值下降并收敛
+
+---
+
+## 📝 最新更新
+
+### 2026-06-14: Gate 修复
+- 🐛 修复 4 个 bug（Gate 梯度截断、中点校正泄漏、Eyring 负样本噪声、pkd mask 默认值）
+- 🔧 `gate_profile` 不再 detach → L_gate 梯度正确到达 gate_net
+- 🔧 `dh_correction *= gate` → gate=0 完全阻断动力学
+- 🔧 Eyring loss 仅对 kcat 标签样本计算
+- 📝 更新 CLAUDE.md + README 反映真实架构
+
+### 2026-06-13
 - ✅ GPU 训练完成：best.ckpt (epoch 81, val loss 0.0056)
 - ✅ Benchmark: pKd ρ=0.895, kcat ρ=0.671
-- ✅ 消融实验：配体 GNN 贡献最大，ODE 多步可压缩至 1 步
-- ✅ 负样本生成脚本 + Gate 正则化
-- ✅ 推理脚本 `predict.py`：SMILES + 蛋白序列 → pKd + kcat
-- ✅ 增强版 Benchmark：ESM-2+MorganFP baselines + 排序指标
+- ✅ 消融实验：配体 GNN 贡献最大，ODE 1 步足够
+- ✅ 负样本生成 + Gate 正则化 + 微调支持
+- ✅ 推理脚本 `predict.py`：SMILES + 蛋白序列 → pKd + kcat + ΔG‡

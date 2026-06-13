@@ -610,7 +610,8 @@ class Trainer:
                 f"(best: {self.best_val_loss:.4f})  |  "
                 f"L_ts: {train_losses.get('L_ts', 0):.4f}  "
                 f"L_cat: {train_losses.get('L_catalysis', 0):.4f}  "
-                f"L_barrier: {train_losses.get('L_barrier', 0):.4f}"
+                f"L_eyr: {train_losses.get('L_eyring', 0):.4f}  "
+                f"L_gate: {train_losses.get('L_gate', 0):.4f}"
             )
             log.info(loss_info)
 
@@ -700,7 +701,7 @@ def main():
     parser.add_argument("--n-ode-steps", type=int, default=1,
                         help="BINN的ODE积分步数（v3默认1步，消融实验确认5步无额外收益）")
     parser.add_argument("--no-gate", action="store_true",
-                        help="(deprecated) BINN门控已在v3中移除，此选项无效果")
+                        help="Disable Gate (ablation only, gate is essential for negative sample training)")
     # 硬件 / GPU
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num-workers", type=int, default=4,
@@ -766,14 +767,16 @@ def main():
 
     # ── 模型 ──
     if args.no_gate:
-        log.warning("--no-gate is deprecated: gate removed in v3 (ablation showed zero contribution)")
+        log.warning("--no-gate: disabling gate (ablation only). Gate is needed for negative sample training.")
     model = Trenzition(
         hidden_dim=args.hidden_dim,
         gnn_layers=args.gnn_layers,
         n_ode_steps=args.n_ode_steps,
+        use_gate=not args.no_gate,
     )
     optimizer_fn = create_trenzition_optimizer
-    log.info("Using Trenzition model (v3: no gate, default 1 ODE step)")
+    log.info(f"Trenzition: hidden={args.hidden_dim}, ODE steps={args.n_ode_steps}, "
+             f"gate={'ON' if not args.no_gate else 'OFF'}, gate_weight={args.gate_weight}")
 
     log.info(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 

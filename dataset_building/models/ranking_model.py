@@ -457,16 +457,21 @@ class LatentPathwayBINN(nn.Module):
             dynamics_input = torch.cat([h, catalyst_h, ligand_h], dim=-1)
             dh = self.dynamics_net(dynamics_input)
             
-            # 门控
+            # 门控（不 detach，否则 Gate 正则化梯度无法回传）
             if self.use_gate:
                 gate = self.gate(h, catalyst_h, ligand_h)
-                gate_values.append(gate.detach())
+                gate_values.append(gate)  # 保留计算图，供 L_gate 回传梯度
                 dh = dh * gate.unsqueeze(-1)
-            
+
             # 二阶（中点）Euler 积分
             h_mid = h + 0.5 * self.dxi * dh
             dynamics_mid = torch.cat([h_mid, catalyst_h, ligand_h], dim=-1)
             dh_correction = self.dynamics_net(dynamics_mid)
+
+            # 中點校正也必須被 Gate 控制，否則 gate=0 時仍有 50% 動力學洩漏
+            if self.use_gate:
+                dh_correction = dh_correction * gate.unsqueeze(-1)
+
             h = h + self.dxi * (dh + dh_correction) / 2
             
             trajectory.append(h.detach())
@@ -608,28 +613,32 @@ class TrenzitionLoss(nn.Module):
             'log10_prefactor', nn.Parameter(torch.tensor(log10_prefactor_init))
         )
 
-    def compute_eyring_loss(self, outputs: dict) -> torch.Tensor:
+    def compute_eyring_loss(self, outputs: dict, mask: torch.Tensor) -> torch.Tensor:
         """
-        Eyring 自洽约束：
+        Eyring 自洽约束（仅对有 kcat 标签的样本）：
         ΔG‡_pred ≈ RT·ln(10) · (log10_prefactor - log10(kcat_pred))
 
         其中 log10(kcat_pred) 从归一化的 catalysis_rate 反归一化得到。
+
+        注意：Eyring 方程描述的是真实催化反应中 kcat ↔ ΔG‡ 的关系，
+        负样本（无催化）不应参与此约束——强行约束无物理意义且会噪声拉扯 log10_prefactor。
         """
         # 反归一化 catalysis_rate → log10(kcat)
         # 归一化区间: kcat_min=-7, kcat_max=8（与 train.py NORM_PARAMS 保持一致）
         kcat_min = -7.0
         kcat_max = 8.0
         log_kcat_pred = outputs['catalysis_rate'] * (kcat_max - kcat_min) + kcat_min
-        
+
         # 从 Eyring 方程计算期望的 ΔG‡ (kJ/mol)
         dG_from_kcat = (
             R_kJ * T_ref * math.log(10) *
             (self.log10_prefactor - log_kcat_pred)
         )
-        
-        # 约束：预测的 dG 应与 Eyring 期望值一致
-        dG_pred = outputs['dG_eyring']
-        loss = F.mse_loss(dG_pred, dG_from_kcat)
+
+        # 约束：预测的 dG 应与 Eyring 期望值一致（仅 kcat 有效样本）
+        dG_pred = outputs['dG_eyring'][mask]
+        dG_target = dG_from_kcat[mask]
+        loss = F.mse_loss(dG_pred, dG_target)
         return loss
 
     def forward(self,
@@ -647,7 +656,7 @@ class TrenzitionLoss(nn.Module):
         losses = {}
 
         # ── 1. 结合亲和力损失 L_ts ──────────────────────
-        pkd_mask = batch.get('pkd_target_mask', torch.ones_like(outputs['ts_stability'], dtype=torch.bool))
+        pkd_mask = batch.get('pkd_target_mask', torch.zeros_like(outputs['ts_stability'], dtype=torch.bool))
 
         if pkd_mask.any():
             l_ts = F.smooth_l1_loss(
@@ -670,9 +679,10 @@ class TrenzitionLoss(nn.Module):
             l_cat = torch.tensor(0.0, device=device)
         losses['L_catalysis'] = l_cat
 
-        # ── 3. Eyring 自洽约束 ──────────────────────────
-        if 'dG_eyring' in outputs and outputs['dG_eyring'] is not None:
-            l_eyring = self.compute_eyring_loss(outputs) * eyring_weight
+        # ── 3. Eyring 自洽约束（仅对有 kcat 标签的样本）──
+        # 负样本没有真实催化反应，Eyring 方程不适用
+        if 'dG_eyring' in outputs and outputs['dG_eyring'] is not None and kcat_mask.any():
+            l_eyring = self.compute_eyring_loss(outputs, kcat_mask) * eyring_weight
         else:
             l_eyring = torch.tensor(0.0, device=device)
         losses['L_eyring'] = l_eyring
@@ -1076,14 +1086,17 @@ if __name__ == "__main__":
     # 模拟前向传播
     print("\n── 前向传播测试 ──")
     B = 8
+    N_per_graph = 5
     from torch_geometric.data import Data
-    
-    # 模拟配体数据
+
+    # 模拟配体数据 (每图5个原子, 共40个原子)
+    total_nodes = B * N_per_graph
     ligand_data = Data(
-        x=torch.randn(B, 20, 79),
-        edge_index=torch.randint(0, 20, (2, 60)),
-        edge_attr=torch.randn(60, 10),
-        batch=torch.randint(0, B, (20,))
+        x=torch.randn(total_nodes, 79),
+        edge_index=torch.randint(0, total_nodes, (2, 30)),
+        edge_attr=torch.randn(30, 10),
+        batch=torch.repeat_interleave(torch.arange(B), N_per_graph),
+        smiles="CCO",  # dummy SMILES for collate compatibility
     )
     
     # 模拟其他输入
