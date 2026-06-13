@@ -15,12 +15,17 @@ dataset_building/processed/
 dataset_building/external_data/
 dataset_building/release/
 
-# Checkpoints
+# Checkpoints (legacy location)
 dataset_building/checkpoints/*
 !dataset_building/checkpoints/.gitkeep
 !dataset_building/checkpoints/*.png
 !dataset_building/checkpoints/*.json
 !dataset_building/checkpoints/training_history.json
+
+# Checkpoints (models/ location)
+dataset_building/models/checkpoints/*.ckpt
+!dataset_building/models/checkpoints/training_history.json
+!dataset_building/models/checkpoints/*.png
 
 # Runtime artifacts
 dataset_building/execution_trace/
