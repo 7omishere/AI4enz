@@ -50,3 +50,5 @@ Thumbs.db
 *.log
 *.tar.gz
 tmp/
+training_data.tar.gz
+checkpoints.tar.gz

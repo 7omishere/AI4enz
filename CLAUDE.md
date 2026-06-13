@@ -109,7 +109,7 @@ AI4enz/
 │   ├── evaluation/             # 模型评估
 │   ├── checkpoints/            # 训练输出快照
 │   ├── release/                # 最终训练数据集
-│   └── processed/ → BINN/       # V5 核心数据 + 辅助文件（符号链接）
+│   └── processed/               # V5 核心数据 + 辅助文件
 ├── README.md                              # 项目简介
 ├── CLAUDE.md                              # 本文件
 ├── scripts/                               # 数据处理脚本
@@ -239,28 +239,35 @@ Split 按 **protein_seq_hash 层级**分配，test/val与train蛋白完全零重
 | SKiD (Scientific Data 2025) | kcat, Km + 3D结构 | ~13k |
 | BindingDB | Kd, Ki | ~153k |
 
-## 当前任务进度 (2026-06-12)
+## 当前任务进度 (2026-06-13)
 
 ### 已完成
-- [x] **metadata.parquet** — 97,351 条，train/val/test 蛋白级划分（零泄漏）
-  - train: 68,876 / val: 13,801 / test: 14,674
-- [x] **ESM-2 蛋白编码** — 19,223/19,223 (100%)，esm2_t33_650M，1280-dim mean-pooled
-  - 总耗时 366 min (0.6 seq/s, CPU)，`proteins.h5` 18 GB
-- [x] **配体 GNN 编码** — 7,249/7,249 (100%)，GATv2×3 图编码，79-dim 原子特征
-- [x] **数据集检查** — pKd/kcat 分布、EC 号覆盖率、跨 split 泄漏全部验证
-- [x] **归一化参数调整** — pKd [0,12], kcat [-7,8]，匹配实际数据分位数
-- [x] **训练策略** — AdamW 分组 LR + warmup(1000 steps) + CosineAnnealingWarmRestarts
-- [x] **参数初始化** — Xavier 定制 gain, 防 sigmoid 饱和 + ODE 稳定
-- [x] **清理旧版文件** — 移除 541k 冗余配体 .pt 文件，释放 5.6 GB
-- [x] **端到端验证** — forward + backward + loss + checkpoint 全链路通过
-- [x] **清理 processed/** — 删除 Pfam HMM 数据库 (~2.4 GB)、日志/临时文件、旧版 `oxidoreductase/` 中间产物 (~82 MB)
+- [x] **GPU 训练** — best.ckpt (epoch 81, val_loss=0.0056)
+- [x] **Benchmark** — pKd ρ=0.895, kcat ρ=0.671 (Trenzition); 增强基线 (ESM-2+MorganFP→MLP: pKd ρ=0.884)
+- [x] **消融实验** — 配体 GNN 贡献最大 (R² 0.703→0.048)，ODE 多步可压缩至 1 步，Gate 已退化为 ~1.0
+- [x] **推理脚本** — `predict.py`: SMILES + 蛋白序列 → pKd + kcat + ΔG‡
+- [x] **负样本生成** — `scripts/generate_negatives.py`: 跨 EC 负采样，metadata_with_negatives.parquet (194k 样本, 1:1)
+- [x] **Gate 正则化** — train.py 支持 `--gate-weight` (L_gate = pos→1, neg→0)
+- [x] **微调支持** — train.py 支持 `--finetune <ckpt_path>`
 
 ### 待完成
-- [ ] **开始训练**: `python models/train.py --epochs 100 --batch-size 128 --device cpu --num-workers 2`
-- [ ] 训练过程监控: loss 曲线、过拟合判断、调参
-- [ ] 评估: test loss、pKd/kcat 相关性、EC 级别泛化
+- [ ] **负样本微调**: `--finetune best.ckpt --unified-metadata metadata_with_negatives.parquet --gate-weight 0.02`
+- [ ] 微调后重新评估: gate 是否学会区分正负样本？pKd/kcat 回归是否提升？
+- [ ] 与已发表模型 (DLKcat/CatPred) 在同数据集上对比
 
-### 重要提醒
-- `/tmp` 容易满（tmpfs 7.7G），后台任务日志写项目目录而非 /tmp
-- 训练质量权重使用 `thermo_w`（按 measurement_type 区分），非全平权
-- 无 GPU，一切 CPU 运行
+### 朋友训练所需文件
+发送以下文件给朋友（放在 AI4enz 目录下解压）：
+1. `training_data.tar.gz` → 解压到项目根目录
+2. `checkpoints/best.ckpt` (25 MB) → 已有（git push 不含）
+3. `processed/metadata_with_negatives.parquet` → 需单独发（gitignored）
+
+朋友微调命令：
+```bash
+cd AI4enz/dataset_building/models
+python train.py \
+  --unified-metadata ../processed/metadata_with_negatives.parquet \
+  --finetune checkpoints/best.ckpt \
+  --epochs 50 --batch-size 256 --lr 5e-5 \
+  --gate-weight 0.02 \
+  --device cuda --num-workers 8 --amp --compile
+```

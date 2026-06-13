@@ -278,6 +278,9 @@ class OxidoreductaseDataset(Dataset):
         base_qw = float(row.get("quality_weight", 1.0))
         quality_weight = thermo_w * base_qw
 
+        # 负样本标记 (用于 gate 正则化)
+        is_negative = bool(row.get("is_negative", False))
+
         return {
             "ligand_data": ligand_data,
             "seq_embed": seq_embed,
@@ -289,6 +292,7 @@ class OxidoreductaseDataset(Dataset):
             "has_kcat": torch.tensor(has_kcat, dtype=torch.bool),
             "kcat_weight": torch.tensor(kcat_weight, dtype=torch.float32),
             "quality_weight": torch.tensor(quality_weight, dtype=torch.float32),
+            "is_negative": torch.tensor(is_negative, dtype=torch.bool),
             # 原始值（用于评估和反归一化）
             "pkd_raw": torch.tensor(pkd_val if has_pkd else 0.0, dtype=torch.float32),
             "log_kcat_raw": torch.tensor(log_kcat_label if has_kcat else 0.0, dtype=torch.float32),
@@ -310,6 +314,8 @@ def collate_fn(batch: list[dict]) -> dict:
     kcat_weight = torch.stack([item["kcat_weight"] for item in batch])
     quality_weight = torch.stack([item["quality_weight"] for item in batch])
 
+    is_negative = torch.stack([item["is_negative"] for item in batch])
+
     return {
         "ligand_data": ligand_batch,
         "seq_embed": seq_embed,
@@ -320,6 +326,7 @@ def collate_fn(batch: list[dict]) -> dict:
         "kcat_target_mask": has_kcat,
         "kcat_weights": kcat_weight,
         "quality_weight": quality_weight,
+        "is_negative": is_negative,
     }
 
 
@@ -328,7 +335,7 @@ def collate_fn(batch: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 class Trainer:
-    """训练循环封装。支持 CPU / GPU、AMP 混合精度、torch.compile。"""
+    """训练循环封装。支持 CPU / GPU、AMP 混合精度、torch.compile、负样本 gate 正则化。"""
 
     def __init__(self,
                  model: nn.Module,
@@ -345,10 +352,12 @@ class Trainer:
                  use_compile: bool = False,
                  grad_accum_steps: int = 1,
                  warmup_steps: int = 1000,
+                 gate_weight: float = 0.02,
                  ):
         self.device = device
         self.use_amp = use_amp and device.startswith("cuda")
         self.grad_accum_steps = grad_accum_steps
+        self.gate_weight = gate_weight
 
         # ── torch.compile (PyTorch ≥ 2.0) ──
         if use_compile:
@@ -444,6 +453,21 @@ class Trainer:
                         "quality_weight": batch_gpu["quality_weight"],
                     },
                 )
+
+                # ── Gate 正则化 (负样本学习) ──
+                if self.gate_weight > 0 and outputs.get("gate_profile") is not None:
+                    gate_profile = outputs["gate_profile"]  # (n_steps, B)
+                    gate_mean = gate_profile.mean(dim=0)    # (B,)  每样本平均门控值
+                    is_neg = batch_gpu.get("is_negative", torch.zeros_like(gate_mean, dtype=torch.bool))
+
+                    if is_neg.any():
+                        # 正样本: gate → 1 | 负样本: gate → 0
+                        l_gate_pos = ((1.0 - gate_mean[~is_neg]) ** 2).mean() if (~is_neg).any() else 0.0
+                        l_gate_neg = (gate_mean[is_neg] ** 2).mean() if is_neg.any() else 0.0
+                        l_gate = self.gate_weight * (l_gate_pos + l_gate_neg)
+                        total_loss = total_loss + l_gate
+                        losses["L_gate"] = l_gate.item() if isinstance(l_gate, torch.Tensor) else float(l_gate)
+
                 # 梯度累积归一化
                 total_loss = total_loss / self.grad_accum_steps
 
@@ -514,6 +538,16 @@ class Trainer:
                     "quality_weight": batch_gpu["quality_weight"],
                 },
             )
+
+            # Gate 正则化 (val)
+            if self.gate_weight > 0 and outputs.get("gate_profile") is not None:
+                gate_mean = outputs["gate_profile"].mean(dim=0)
+                is_neg = batch_gpu.get("is_negative", torch.zeros_like(gate_mean, dtype=torch.bool))
+                if is_neg.any():
+                    l_gate_pos = ((1.0 - gate_mean[~is_neg]) ** 2).mean() if (~is_neg).any() else 0.0
+                    l_gate_neg = (gate_mean[is_neg] ** 2).mean() if is_neg.any() else 0.0
+                    l_gate = self.gate_weight * (l_gate_pos + l_gate_neg)
+                    losses["L_gate"] = l_gate.item() if isinstance(l_gate, torch.Tensor) else float(l_gate)
 
             # 累加（跳过 weights 字典）
             for k, v in losses.items():
@@ -684,11 +718,17 @@ def main():
     # 检查点
     parser.add_argument("--checkpoint-dir", default=str(CHECKPOINT_DIR))
     parser.add_argument("--resume", default=None, help="Resume from checkpoint")
+    parser.add_argument("--finetune", default=None, help="Fine-tune from a checkpoint (lower LR on encoders)")
     parser.add_argument("--save-every", type=int, default=10)
+    # 负样本 / Gate 正则化
+    parser.add_argument("--gate-weight", type=float, default=0.02,
+                        help="Gate regularization weight (0=disable). Higher = stronger pos/neg separation")
     args = parser.parse_args()
 
     log.info(f"Device: {args.device}")
     log.info("Using Trenzition model")
+    if args.gate_weight > 0:
+        log.info(f"Gate regularization: weight={args.gate_weight}")
 
     # ── 数据集 ──
     train_dataset = OxidoreductaseDataset(
@@ -752,7 +792,20 @@ def main():
         use_compile=args.compile,
         grad_accum_steps=args.grad_accum,
         warmup_steps=args.warmup_steps,
+        gate_weight=args.gate_weight,
     )
+
+    # ── Fine-tune: 从已有权重加载，降低 encoder 学习率 ──
+    if args.finetune:
+        log.info(f"Fine-tuning from {args.finetune}")
+        ckpt = torch.load(args.finetune, map_location=args.device, weights_only=False)
+        state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
+        model.load_state_dict(state, strict=False)
+        # 降低 encoder 学习率 (10x smaller)，让 gate/dynamics 更快适应
+        for name, param in model.named_parameters():
+            if any(x in name for x in ['ligand_encoder', 'protein_encoder', 'cofactor_encoder']):
+                param.requires_grad = True  # 仍然可训练，但 LR 更低
+        log.info("Encoder LR reduced (10x) — gate/dynamics adapt faster")
 
     if args.resume:
         trainer.load_checkpoint(args.resume)

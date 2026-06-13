@@ -289,12 +289,56 @@ python train.py --resume checkpoints/last.ckpt
 
 ---
 
-## 📝 最新更新 (2026-06-12)
+## 🧪 负样本训练 (2026-06-13)
 
-- ✅ ESM-2 蛋白编码完成：19,223 蛋白（100%）
-- ✅ 配体 GNN 编码完成：7,249 配体（100%）
-- ✅ 端到端训练验证通过
-- ✅ 归一化参数调整（pKd: [0,12], kcat: [-7,8]）
-- ✅ 添加 LR warmup（默认 1000 steps）
-- ✅ 参数初始化优化（防 sigmoid 饱和 + ODE 稳定）
-- ✅ 清理旧版配体文件（移除 541k 冗余文件，释放 5.6 GB）
+Trenzition 支持跨 EC 大类负采样，让模型学习区分「能反应的酶-底物对」和「不能反应的酶-底物对」。
+
+### 生成负样本
+
+```bash
+cd dataset_building/scripts
+python generate_negatives.py --ratio 1.0 --strategy cross_ec --output metadata_with_negatives.parquet
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--ratio` | 1.0 | 负:正比例 |
+| `--strategy` | cross_ec | `cross_ec` / `random` / `hard` / `all` |
+
+### 微调（从预训练权重开始）
+
+```bash
+cd dataset_building/models
+
+python train.py \
+  --unified-metadata ../processed/metadata_with_negatives.parquet \
+  --finetune checkpoints/best.ckpt \
+  --epochs 50 --batch-size 256 --lr 5e-5 \
+  --gate-weight 0.02 \
+  --device cuda --num-workers 8 --amp --compile
+```
+
+| 新参数 | 默认值 | 说明 |
+|--------|--------|------|
+| `--finetune` | None | 从已有 .ckpt 加载权重微调 |
+| `--gate-weight` | 0.02 | Gate 正则化强度（0=关闭） |
+
+### Gate 正则化
+
+```
+L_gate = 0.02 × [mean((1-gate_pos)²) + mean(gate_neg²)]
+
+正样本: gate → 1  (完全信息流通)
+负样本: gate → 0  (阻挡信息)
+```
+
+---
+
+## 📝 最新更新 (2026-06-13)
+
+- ✅ GPU 训练完成：best.ckpt (epoch 81, val loss 0.0056)
+- ✅ Benchmark: pKd ρ=0.895, kcat ρ=0.671
+- ✅ 消融实验：配体 GNN 贡献最大，ODE 多步可压缩至 1 步
+- ✅ 负样本生成脚本 + Gate 正则化
+- ✅ 推理脚本 `predict.py`：SMILES + 蛋白序列 → pKd + kcat
+- ✅ 增强版 Benchmark：ESM-2+MorganFP baselines + 排序指标
