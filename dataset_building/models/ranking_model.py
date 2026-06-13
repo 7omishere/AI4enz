@@ -310,91 +310,40 @@ class ProteinEncoder(nn.Module):
 #   - "推理深度"的概念：不同酶-底物对可能需要不同的处理步数
 #   - 门控 profile 可作为可解释性工具（哪些步信息流量大）
 
-class LatentGate(nn.Module):
-    """
-    信息流门控机制。
-    
-    核心思想：
-    - 每个推理步决定"多少信息可以通过"
-    - 门控值 ∈ [0, 1]：1=完全通过，0=完全阻挡
-    - 门控由当前状态 + 酶催化上下文 + 底物信息共同决定
-    
-    设计动机：
-    - 不同的酶-底物对可能需要不同的"推理深度"
-    - 门控让模型学会自适应地控制每步的信息流
-    - 训练后可以通过 gate_profile 观察："哪些步骤信息流量大"
-    
-    注意：这不是物理"能垒"——门控值不代表能量。
-    它是潜在特征空间中信息流量的可学习控制机制。
-    """
-
-    def __init__(self, hidden_dim: int = 256):
-        super().__init__()
-        self.gate_net = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),  # h + catalyst + ligand context
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()  # 输出 [0, 1]
-        )
-
-    def forward(self, 
-                h: torch.Tensor,           # (B, D) 当前状态
-                catalyst_h: torch.Tensor,  # (B, D) 酶催化上下文
-                ligand_h: torch.Tensor,    # (B, D) 底物状态
-               ) -> torch.Tensor:
-        """
-        Returns:
-            gate_value: (B,) ∈ [0, 1]，门控值
-        """
-        context = torch.cat([h, catalyst_h, ligand_h], dim=-1)
-        gate = self.gate_net(context).squeeze(-1)
-        return gate
-
-
 class LatentPathwayBINN(nn.Module):
     """
-    潜在特征路径上的多步特征变换。
+    潜在特征路径上的多步特征变换。（精简版 v3：移除门控，默认单步）
 
     核心思想：
     1. 酶-底物复合物的初始表示 h₀ 经过 N 步逐步变换
     2. 每一步 dh = f(h, 酶上下文, 底物) 由共享的动力学网络预测
-    3. 门控机制控制每步信息流量：dh_actual = gate × dh
-    4. 最终输出 h_reaction = output_proj(concat(h_final, h_initial))
+    3. 最终输出 h_reaction = output_proj(concat(h_final, h_initial))
 
-    设计动机：
-    - 共享的"动力学网络"学到对所有酶-底物对最优的通用特征变换路径
-    - 门控让每个具体样本决定"需要多少步处理"
-    - 训练后 gate_profile 揭示哪些酶-底物对需要更深的"推理"
-    - 这不是物理反应坐标——ξ 只是步索引，不是空间坐标
-    
-    关键区别（与物理反应坐标不同）：
-    - ξ 没有物理单位，不表示"反应进度"
-    - 门控值不是"能垒"，而是信息流量
-    - 步数 N 是超参数，不是物理决定的
+    消融实验表明：
+    - 门控机制无贡献（R² 不变），已移除
+    - ODE 多步积分无贡献（1步 vs 5步 R² 一致），默认 1步
+    - 动力学网络等价于一个复杂的非线性变换
     """
 
     def __init__(
-        self, 
+        self,
         hidden_dim: int = 256,
-        n_ode_steps: int = 5,
-        use_gate: bool = True
+        n_ode_steps: int = 1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_steps = n_ode_steps
-        self.use_gate = use_gate
-        
-        # Step 1: 初始状态构建（酶-底物复合物特征融合）
+
+        # 初始状态构建（酶-底物复合物特征融合）
         self.initial_state_proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),  # protein + ligand
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Dropout(0.1),
         )
-        
-        # Step 2: 特征变换动力学函数
+
+        # 特征变换动力学函数
         #   learns: dh = f(h, catalyst_context, ligand)
-        #   注：使用GeLU替代SiLU，与ESM-2保持一致，梯度更流畅
         self.dynamics_net = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),  # h + catalyst + ligand
             nn.LayerNorm(hidden_dim),
@@ -403,15 +352,11 @@ class LatentPathwayBINN(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),  # 保证动力学稳定（有界输出）
         )
-        
+
         # 步长
-        self.dxi = 1.0 / n_ode_steps
-        
-        # Step 3: 门控机制
-        if use_gate:
-            self.gate = LatentGate(hidden_dim)
-        
-        # Step 4: 输出投影（最终状态 + 初始状态）
+        self.dxi = 1.0 / max(n_ode_steps, 1)
+
+        # 输出投影（最终状态 + 初始状态）
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -420,67 +365,53 @@ class LatentPathwayBINN(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-    def forward(self, 
+    def forward(self,
                 protein_h: torch.Tensor,   # (B, D)
                 ligand_h: torch.Tensor,    # (B, D)
                 cofactor_h: torch.Tensor   # (B, D_cf)
                ) -> dict[str, torch.Tensor]:
         """
-        Args:
-            protein_h: 酶的隐藏状态
-            ligand_h:  底物的隐藏状态
-            cofactor_h: 辅因子的隐藏状态
-        
         Returns:
             h_reaction: (B, D) 多步变换后的最终状态
             trajectory: list of (B, D) 每一步的状态
-            gate_profile: (B, n_steps) 每步的门控值（信息流量）
             feature_evol: (B,) 特征变化幅度（诊断用）
         """
         B = protein_h.size(0)
         device = protein_h.device
-        
+
         # 催化剂上下文 = 酶 + 辅因子
         catalyst_h = protein_h + cofactor_h
-        
-        # ── Step 1: 构建初始状态 ──────────────────
+
+        # 构建初始状态
         es_complex = torch.cat([protein_h, ligand_h], dim=-1)
         h0 = self.initial_state_proj(es_complex)
-        
+
         trajectory = [h0]
-        gate_values = []
-        
-        # ── Step 2: 多步特征变换 ──────────────────
+
+        # 多步特征变换（无门控，消融实验确认门控无贡献）
         h = h0
         for step in range(self.n_steps):
             dynamics_input = torch.cat([h, catalyst_h, ligand_h], dim=-1)
             dh = self.dynamics_net(dynamics_input)
-            
-            # 门控
-            if self.use_gate:
-                gate = self.gate(h, catalyst_h, ligand_h)
-                gate_values.append(gate.detach())
-                dh = dh * gate.unsqueeze(-1)
-            
+
             # 二阶（中点）Euler 积分
             h_mid = h + 0.5 * self.dxi * dh
             dynamics_mid = torch.cat([h_mid, catalyst_h, ligand_h], dim=-1)
             dh_correction = self.dynamics_net(dynamics_mid)
             h = h + self.dxi * (dh + dh_correction) / 2
-            
+
             trajectory.append(h.detach())
-        
-        # ── Step 3: 输出 ──────────────────────────────────
+
         # 特征变化幅度
         feature_evol = (h - h0).pow(2).mean(dim=-1)  # (B,)
-        
+
         # 最终输出
         h_reaction = self.output_proj(torch.cat([h, h0], dim=-1))
-        
+
         return {
             'h_reaction': h_reaction,
             'trajectory': trajectory,
-            'gate_profile': torch.stack(gate_values) if gate_values else None,
+            'gate_profile': None,  # 已移除，保留 key 兼容
             'feature_evol': feature_evol,
         }
 
@@ -731,12 +662,11 @@ class Trenzition(nn.Module):
         cofactor_embed_dim: int = 64,
         n_heads: int = 4,
         gnn_layers: int = 3,
-        n_ode_steps: int = 5,
-        use_gate: bool = True,
+        n_ode_steps: int = 1,
         use_learnable_weights: bool = False,
-        use_classification: bool = False,  # ✅ 分类模式开关
-        num_classes: int = 4,              # ✅ 分类类别数
-        classification_init_thresholds: list = [-2.0, -1.0, 1.0],  # ✅ 初始阈值
+        use_classification: bool = False,
+        num_classes: int = 4,
+        classification_init_thresholds: list = [-2.0, -1.0, 1.0],
     ):
         super().__init__()
 
@@ -761,11 +691,10 @@ class Trenzition(nn.Module):
         self.ligand_proj = nn.Linear(hidden_dim, hidden_dim)
         self.cofactor_proj = nn.Linear(cofactor_embed_dim, hidden_dim)
 
-        # ─────── BINN交互层 ───────
+        # ─────── BINN交互层（精简版 v3：无门控，默认单步）───────
         self.binn = LatentPathwayBINN(
             hidden_dim=hidden_dim,
             n_ode_steps=n_ode_steps,
-            use_gate=use_gate,
         )
 
         # ─────── 预测头（根据模式选择）───────

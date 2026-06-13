@@ -663,10 +663,10 @@ def main():
     # 模型参数 (Trenzition)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--gnn-layers", type=int, default=3)
-    parser.add_argument("--n-ode-steps", type=int, default=5,
-                        help="BINN的ODE积分步数")
+    parser.add_argument("--n-ode-steps", type=int, default=1,
+                        help="BINN的ODE积分步数（v3默认1步，消融实验确认5步无额外收益）")
     parser.add_argument("--no-gate", action="store_true",
-                        help="禁用BINN的门控机制")
+                        help="(deprecated) BINN门控已在v3中移除，此选项无效果")
     # 硬件 / GPU
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num-workers", type=int, default=4,
@@ -725,14 +725,15 @@ def main():
     )
 
     # ── 模型 ──
+    if args.no_gate:
+        log.warning("--no-gate is deprecated: gate removed in v3 (ablation showed zero contribution)")
     model = Trenzition(
         hidden_dim=args.hidden_dim,
         gnn_layers=args.gnn_layers,
         n_ode_steps=args.n_ode_steps,
-        use_gate=not args.no_gate,
     )
     optimizer_fn = create_trenzition_optimizer
-    log.info("Using Trenzition model")
+    log.info("Using Trenzition model (v3: no gate, default 1 ODE step)")
 
     log.info(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
