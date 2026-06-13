@@ -52,3 +52,4 @@ Thumbs.db
 tmp/
 training_data.tar.gz
 checkpoints.tar.gz
+metadata_with_negatives.parquet.gz
