@@ -3,6 +3,7 @@
 AI 辅助酶挖掘项目。基于过渡态理论构建酶-底物结合亲和力预测模型，服务于"给定目标底物 → 推荐酶序列"的酶挖掘场景。
 
 每次回复前都叫我：**"多米"**
+原则是：我允许你不懂，你绝对不要不懂装懂，任何建议都需要有真实的理论支撑
 
 ## 核心架构：Trenzition
 
@@ -215,7 +216,7 @@ python train.py --epochs 10 --batch-size 128 --warmup-steps 0
 |------|--------|----------|
 | 蛋白 ESM-2 | 19,223/19,223 (100%) | esm2_t33_650M, 1280-dim mean-pool |
 | 配体 GNN | 7,249/7,249 (100%) | GATv2×3, 79-dim 原子特征 + 10-dim 键特征 |
-| 辅因子 | 57.8% 非空 | 310 种组合，可学习 Embedding |
+| 辅因子 | 71.5% 非空（2026-06-15 补充） | 310 种组合，可学习 Embedding |
 
 ### Split（蛋白层级，零泄漏）
 
@@ -234,7 +235,7 @@ Split 按 **protein_seq_hash 层级**分配，test/val与train蛋白完全零重
 | 🟡 中 | 无 GPU | CPU 训练较慢，97k 样本 × 100 epoch ≈ 3 天 |
 | 🟡 中 | proteins.h5 含历史数据 | 53,133 个蛋白中仅 19,223 用于当前训练集 |
 | 🟡 中 | quality_weight 未使用 | `THERMO_WEIGHT` 计算了但 Loss 未加权，Ki/Kd/IC50 等权训练 |
-| 🟢 低 | 辅因子覆盖 | 可后续补充稀有辅因子 |
+| 🟢 低 | 辅因子覆盖 | 已补充至 71.5%（EC推断+UniProt API），剩余 28.5% 多为天然无辅因子的酶 |
 | 🟢 低 | 结构/口袋特征未启用 | metadata 中 has_structure/has_binding_site 均为默认值 |
 | 🟢 低 | 无早停/EMA | 辅助稳定性技巧，有空可加 |
 
@@ -261,6 +262,10 @@ Split 按 **protein_seq_hash 层级**分配，test/val与train蛋白完全零重
   3. Eyring loss 仅对 kcat 标签样本计算 → 负样本不再噪声拉扯 log10_prefactor
   4. `pkd_target_mask` 默认值改为 zeros_like（安全默认）
 - [x] **微调支持** — train.py 支持 `--finetune <ckpt_path>` + `--gate-weight`
+- [x] **辅因子补充 (2026-06-15)** — metadata.parquet 辅因子覆盖率 57.8% → **71.5%**
+  1. EC 全码高置信推断（684 条规则，+10,941 条）
+  2. UniProt REST API 批量查询（262 个蛋白命中，+1,711 条）
+  3. 剩余 28.5% 多为天然无辅因子的酶（EC 3 水解酶、EC 5 异构酶等）
 
 ### 待完成
 - [ ] **负样本微调** (修复后重新训练)
