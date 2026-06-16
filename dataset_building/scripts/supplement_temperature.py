@@ -89,20 +89,34 @@ def build_oed_temperature_map(oed_path: str) -> dict:
         temp_map[key] = np.median(temps)
 
     log.info(f"Built temperature map: {len(temp_map)} (uniprot, ec) keys")
-    return temp_map
+
+    # 也构建 EC-only 回退映射
+    ec_temp_collector = defaultdict(list)
+    for (uni, ec), temp_c in temp_map.items():
+        if ec:
+            ec_temp_collector[ec].append(temp_c)
+    ec_temp_map = {ec: np.median(temps) for ec, temps in ec_temp_collector.items()}
+    log.info(f"Built EC-only fallback map: {len(ec_temp_map)} EC keys")
+
+    return temp_map, ec_temp_map
 
 
 def supplement_metadata(
     metadata_path: str,
     output_path: str,
     temp_map: dict,
+    ec_temp_map: dict,
     default_temp: float = 298.15,
 ) -> pd.DataFrame:
     """
     为 metadata 补充温度列。
 
+    匹配策略（优先级递减）:
+    1. OED (uniprot_id, ec_numbers) → 中位数温度
+    2. OED (ec_numbers) → 中位数温度 (EC-only 回退)
+    3. 默认 298.15K
+
     OED 温度是 °C，需要转为 Kelvin。
-    匹配不到的用 default_temp K。
     """
     log.info(f"Loading metadata from {metadata_path}")
     df = pd.read_parquet(metadata_path)
@@ -111,7 +125,7 @@ def supplement_metadata(
     # 初始化为默认温度 (K)
     df["temperature_K"] = default_temp
 
-    # 构建匹配键
+    # ── 策略 1: (uniprot, ec) 精确匹配 ──
     uniprot_ids = df["uniprot_id"].fillna("")
     ec_numbers = df["ec_numbers"].fillna("")
     keys = list(zip(uniprot_ids, ec_numbers))
@@ -128,22 +142,41 @@ def supplement_metadata(
     )
     df.loc[matched_mask, "temperature_K"] = matched_temps_c + 273.15
 
+    # ── 策略 2: EC-only 回退 ──
+    still_default = df["temperature_K"] == default_temp
+    ec_only_keys = df.loc[still_default, "ec_numbers"].fillna("")
+    ec_fallback_mask = ec_only_keys.isin(ec_temp_map.keys())
+    n_ec_fallback = ec_fallback_mask.sum()
+    log.info(f"\nEC-only fallback: +{n_ec_fallback}/{len(df)} "
+             f"({100 * n_ec_fallback / len(df):.1f}%)")
+
+    # 应用 EC-only 回退温度
+    ec_fallback_indices = still_default.index[still_default][ec_fallback_mask.values]
+    ec_fallback_temps_c = ec_only_keys[ec_fallback_mask.values].map(ec_temp_map)
+    df.loc[ec_fallback_indices, "temperature_K"] = ec_fallback_temps_c.values + 273.15
+
+    # 最终统计
+    log.info(f"\nFinal coverage:")
+    n_with_any_temp = (df["temperature_K"] != default_temp).sum()
+    log.info(f"  with non-default temperature: {n_with_any_temp}/{len(df)} "
+             f"({100 * n_with_any_temp / len(df):.1f}%)")
+
     # 温度统计
-    log.info(f"Temperature stats (K):")
     temps = df["temperature_K"]
+    log.info(f"Temperature stats (K):")
     log.info(f"  min={temps.min():.1f}, max={temps.max():.1f}")
     log.info(f"  mean={temps.mean():.1f}, median={temps.median():.1f}")
     log.info(f"  default (298.15K) used for: {(temps == 298.15).sum()} entries")
 
     # 按 split 统计覆盖
-    log.info(f"Coverage by split:")
+    log.info(f"\nCoverage by split:")
     for split_name in ["train", "val", "test"]:
         split_df = df[df["split"] == split_name]
-        split_matched = matched_mask[df["split"] == split_name].sum()
+        split_covered = (split_df["temperature_K"] != default_temp).sum()
         split_total = len(split_df)
         log.info(
-            f"  {split_name}: {split_matched}/{split_total} "
-            f"({100 * split_matched / split_total:.1f}%)"
+            f"  {split_name}: {split_covered}/{split_total} "
+            f"({100 * split_covered / split_total:.1f}%)"
         )
 
     # 保存
@@ -154,8 +187,8 @@ def supplement_metadata(
 
 
 def main():
-    # 1. 构建 OED 温度映射
-    temp_map = build_oed_temperature_map(str(OED_PATH))
+    # 1. 构建 OED 温度映射（含 EC-only 回退）
+    temp_map, ec_temp_map = build_oed_temperature_map(str(OED_PATH))
 
     # 2. 补充 V5 核心 metadata
     log.info("\n" + "=" * 60)
@@ -165,6 +198,7 @@ def main():
         metadata_path=str(V5_METADATA_PATH),
         output_path=str(V5_METADATA_PATH),  # 覆盖写入
         temp_map=temp_map,
+        ec_temp_map=ec_temp_map,
     )
 
     # 3. 补充含负样本的 metadata (负样本也写入默认温度，方便统一加载)
@@ -175,6 +209,7 @@ def main():
         metadata_path=str(V5_WITH_NEG_PATH),
         output_path=str(V5_WITH_NEG_PATH),  # 覆盖写入
         temp_map=temp_map,
+        ec_temp_map=ec_temp_map,
     )
 
     # 4. 验证: 温度分布可视化

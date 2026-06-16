@@ -103,7 +103,9 @@ def bond_features(bond: rdchem.Bond) -> torch.Tensor:
 
 def smiles_to_graph(smiles: str) -> Optional[Data]:
     try:
-        mol = Chem.MolFromSmiles(smiles)
+        # 清理 RDKit 构图注释 (如 |TLB:...|, |c:...| 等)
+        clean_smi = smiles.split(" |")[0].split("|")[0].strip()
+        mol = Chem.MolFromSmiles(clean_smi)
         if mol is None:
             return None
         mol = Chem.AddHs(mol)
@@ -112,7 +114,7 @@ def smiles_to_graph(smiles: str) -> Optional[Data]:
         return None
 
     n_atoms = mol.GetNumAtoms()
-    if n_atoms < 2:
+    if n_atoms < 1:
         return None
 
     x = torch.stack([atom_features(atom) for atom in mol.GetAtoms()])
@@ -128,17 +130,19 @@ def smiles_to_graph(smiles: str) -> Optional[Data]:
         edge_indices.append([j, i])
         edge_attrs.append(bf)
 
+    # 单原子/离子: 无键, 用空边
     if not edge_indices:
-        return None
-
-    edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
-    edge_attr = torch.stack(edge_attrs)
+        edge_index = torch.zeros(2, 0, dtype=torch.long)
+        edge_attr = torch.zeros(0, 10)
+    else:
+        edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
+        edge_attr = torch.stack(edge_attrs)
 
     return Data(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
-        smiles=smiles,
+        smiles=clean_smi,
         num_nodes=n_atoms,
     )
 

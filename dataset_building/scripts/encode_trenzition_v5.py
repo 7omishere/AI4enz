@@ -97,7 +97,11 @@ def build_metadata(df: pd.DataFrame) -> pd.DataFrame:
     meta["pkd_aligned"] = df["pkd_value"]  # 无 calibration step，直接用
 
     # ── measurement_type ──
-    meta["measurement_type"] = df["measurement_type_pkd"].fillna("Kd")
+    # 注意: improve_dataset.py 已清理 measurement_type_pkd:
+    #   - 有 pKd 但 type 缺失 → "Kd"
+    #   - 无 pKd → "" (不再错误标记为 Kd)
+    meta["measurement_type"] = df["measurement_type_pkd"].fillna("")
+    # 旧版的 fillna("Kd") 将无 pKd 的行也错标为 Kd，已在 improve_dataset.py 修复
 
     # ── kcat 字段 ──
     kcat_vals = df["kcat_per_s"].copy()
@@ -107,6 +111,19 @@ def build_metadata(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── kcat_source ──
     meta["kcat_source"] = df["kcat_per_s_source"].map(KCAT_SOURCE_MAP).fillna("unknown")
+
+    # ── Km 字段（三头 KmHead 使用）──
+    km_raw = df["km_M"].copy()
+    km_pos = km_raw[km_raw > 0]  # Km > 0 才有效
+    meta["km_M"] = km_raw
+    meta["has_km"] = km_raw.notna() & (km_raw > 0)
+    meta["log_km"] = np.nan
+    meta.loc[meta["has_km"], "log_km"] = np.log10(km_pos)
+
+    # ── 测量类型编码（三头 BindingHead 使用）──
+    # Kd=0, Ki=1, IC50_approx=2, ""=3
+    mtype_map = {"Kd": 0, "Ki": 1, "IC50_approx": 2, "": 3, "IC50": 2}
+    meta["measurement_type_encoded"] = meta["measurement_type"].map(mtype_map).fillna(3).astype(int)
 
     # ── 全平权（用户要求） ──
     meta["quality_weight"] = 1.0
