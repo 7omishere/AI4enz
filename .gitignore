@@ -53,3 +53,17 @@ tmp/
 training_data.tar.gz
 checkpoints.tar.gz
 metadata_with_negatives.parquet.gz
+
+# Raw data — track nothing under these
+dataset_building/turnup/
+dataset_building/uniprotprot/
+dataset_building/BRENDA/
+dataset_building/BindingDB/
+dataset_building/OED/
+dataset_building/SABIO-RK/
+dataset_building/SKiD/
+dataset_building/KEGG/
+
+# Old model archives with checkpoints (>25MB)
+dataset_building/models_v1_obsolete/checkpoints/
+dataset_building/models_v1_obsolete/*.ckpt
