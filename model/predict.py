@@ -2,6 +2,8 @@
 """
 Trenzition 三头推理脚本：给定底物 + 酶序列 → 预测 Kd/Ki + kcat + Km
 
+依赖: ESM-2 (fair-esm) — token 级嵌入, 约 2.5 GB 显存
+
 三头输出：
   - pKd (Kd 分支): -log10(Kd)，底物结合亲和力，越高越强
   - pKi (Ki 分支): -log10(Ki)，抑制剂结合近似常数
@@ -24,7 +26,7 @@ import argparse, sys, os, logging
 from pathlib import Path
 import numpy as np
 import torch
-from torch_geometric.data import Data
+import torch_geometric
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("predict")
@@ -41,7 +43,7 @@ PKD_MIN, PKD_MAX = 0.0, 12.0
 KCAT_MIN, KCAT_MAX = -7.0, 8.0
 KM_MIN, KM_MAX = -13.0, 3.0
 
-# ── SMILES → 分子图 (与 dataset_building/pipeline 一致) ──
+# ── SMILES → 分子图 ──
 
 from rdkit import Chem
 from rdkit.Chem import rdchem
@@ -121,7 +123,7 @@ def smiles_to_graph(smiles: str):
     if not edge_idx:
         return None
 
-    return Data(
+    return torch_geometric.data.Data(
         x=torch.stack([atom_features(a) for a in mol.GetAtoms()]),
         edge_index=torch.tensor(edge_idx, dtype=torch.long).t().contiguous(),
         edge_attr=torch.stack(edge_attr),
@@ -129,53 +131,51 @@ def smiles_to_graph(smiles: str):
     )
 
 
-# ── 蛋白序列 → ESM-2 嵌入 ──
+# ── 蛋白序列 → 完整的 ESM-2 token 级嵌入 (L, 1280) ──
 
-def compute_esm2_embedding(sequence: str, model, tokenizer, device="cpu"):
-    """单条序列 → ESM-2 mean-pooled embedding (1280-dim)"""
+def compute_esm2_tokens(sequence: str, model, tokenizer, device="cpu"):
+    """"
+    单条序列 → 完整的 token 级 ESM-2 嵌入 (L', 1280)
+
+    Returns:
+        tokens:     (L', 1280) 每残基嵌入（排除特殊 token）
+        mask:       (L',) 有效掩码 (全 True)
+        seq_len:    实际残基数 L'
+    """
     import esm
     tokens = tokenizer(sequence, return_tensors="pt")
     tokens = {k: v.to(device) for k, v in tokens.items()}
     with torch.no_grad():
         result = model(**tokens, output_hidden_states=True)
-    # 取最后一层，mean pool (排除特殊 token)
+    # 取最后一层, 排除特殊 token [CLS] 和 [EOS] → (L, 1280)
     hidden = result["hidden_states"][-1][0, 1:-1, :]  # (L, 1280)
-    return hidden.mean(dim=0).cpu()
-
-
-def sequence_to_aa_props(seq: str) -> torch.Tensor:
-    """轻量级 AA 物化性质编码 (6-dim)，不需要 ESM-2"""
-    AA_PROPERTIES = {
-        "A":[1.8,31.0,0.0,0.0,1.0,1.0], "R":[-4.5,124.0,1.0,1.0,1.0,6.13],
-        "N":[-3.5,56.0,0.0,1.0,1.0,2.95], "D":[-3.5,54.0,-1.0,1.0,1.0,2.78],
-        "C":[2.5,55.0,0.0,0.0,0.0,1.0], "Q":[-3.5,85.0,0.0,1.0,1.0,3.0],
-        "E":[-3.5,83.0,-1.0,1.0,1.0,3.0], "G":[-0.4,3.0,0.0,0.0,2.0,0.0],
-        "H":[-3.2,96.0,0.1,1.0,1.0,2.98], "I":[4.5,111.0,0.0,0.0,1.0,4.0],
-        "L":[3.8,111.0,0.0,0.0,1.0,4.0], "K":[-3.9,119.0,1.0,1.0,1.0,5.0],
-        "M":[1.9,105.0,0.0,0.0,1.0,3.8], "F":[2.8,132.0,0.0,0.0,0.0,5.89],
-        "P":[-1.6,32.0,0.0,0.0,2.0,2.5], "S":[-0.8,32.0,0.0,1.0,1.0,1.5],
-        "T":[-0.7,61.0,0.0,1.0,1.0,2.6], "W":[-0.9,170.0,0.0,1.0,0.0,8.08],
-        "Y":[-1.3,136.0,0.0,1.0,0.0,6.47], "V":[4.2,84.0,0.0,0.0,1.0,3.0],
-    }
-    feats = [AA_PROPERTIES.get(aa, [0.0]*6) for aa in seq[:1020].upper()]
-    return torch.tensor(feats, dtype=torch.float32).mean(dim=0) if feats else torch.zeros(6)
+    L = hidden.shape[0]
+    mask = torch.ones(L, dtype=torch.bool)
+    return hidden.cpu(), mask, L
 
 
 # ── 主推理 ──
 
-def predict_single(model, smiles, seq_embed, cofactor_str="", device="cpu",
-                   measurement_type=0, temperature_K=298.15):
-    """单样本推理 (三头模型, EyringKcatHead 需要温度)"""
+def predict_single(model, smiles, protein_tokens, protein_mask, cofactor_str="",
+                   device="cpu", measurement_type=0, temperature_K=298.15):
+    """单样本推理 (三头模型, token-only)"""
     g = smiles_to_graph(smiles)
     if g is None:
         raise ValueError(f"无法解析 SMILES: {smiles}")
 
+    # 构造 batch
+    from torch_geometric.data import Batch as PyGBatch
+    ligand_batch = PyGBatch.from_data_list([g]).to(device)
+    tokens_batch = protein_tokens.unsqueeze(0).to(device)   # (1, L, 1280)
+    mask_batch = protein_mask.unsqueeze(0).to(device)        # (1, L)
+
     model.eval()
     with torch.no_grad():
         out = model(
-            g.to(device),
-            seq_embed.unsqueeze(0).to(device),
-            [cofactor_str],
+            ligand_data=ligand_batch,
+            protein_tokens=tokens_batch,
+            protein_mask=mask_batch,
+            cofactor_strs=[cofactor_str],
             measurement_types=torch.tensor([measurement_type], device=device),
             temperature_K=torch.tensor([temperature_K], device=device),
         )
@@ -197,16 +197,17 @@ def predict_single(model, smiles, seq_embed, cofactor_str="", device="cpu",
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trenzition 三头酶-底物预测")
+    parser = argparse.ArgumentParser(description="Trenzition 三头酶-底物预测 (ESM-2 token 模式)")
     parser.add_argument("--smiles", help="底物 SMILES")
     parser.add_argument("--sequence", help="蛋白氨基酸序列 (单字母)")
     parser.add_argument("--cofactor", default="", help="辅因子，如 'NAD|FAD'")
     parser.add_argument("--csv", help="批量预测 CSV (columns: smiles, sequence, cofactor)")
     parser.add_argument("--output", default="predictions.csv")
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--use-esm2", action="store_true",
-                        help="使用 ESM-2 编码 (需安装 fair-esm，约 2.5 GB 显存)")
-    parser.add_argument("--esm2-model", default="esm2_t33_650M_UR50D")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--checkpoint", default=str(BEST_CKPT),
+                        help="模型 checkpoint 路径")
+    parser.add_argument("--esm2-model", default="esm2_t33_650M_UR50D",
+                        help="ESM-2 模型名称")
     parser.add_argument("--measurement-type", type=int, default=0,
                         help="测量类型: 0=Kd (默认), 1=Ki, 2=IC50, 3=none")
     parser.add_argument("--temperature", type=float, default=298.15,
@@ -215,46 +216,48 @@ def main():
 
     device = torch.device(args.device)
 
-    # 加载模型 (三头)
-    log.info(f"Loading Trenzition (three-head) from {BEST_CKPT}...")
+    # ── 加载 ESM-2 (必须) ──
+    try:
+        import esm
+    except ImportError:
+        log.error("需要 fair-esm: pip install fair-esm")
+        sys.exit(1)
+
+    log.info(f"Loading ESM-2 ({args.esm2_model})...")
+    esm_model, alphabet = esm.pretrained.load_model_and_alphabet(args.esm2_model)
+    esm_model = esm_model.to(device).eval()
+    tokenizer = alphabet.get_batch_converter()
+    log.info("ESM-2 loaded")
+
+    # ── 加载 Trenzition 模型 ──
+    log.info(f"Loading Trenzition (three-head) from {args.checkpoint}...")
     model = Trenzition(hidden_dim=256, gnn_layers=3,
                        three_head=True, kcat_ode_steps=10).to(device)
-    ckpt = torch.load(BEST_CKPT, map_location=device, weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
     model.load_state_dict(state, strict=False)
     model.eval()
     log.info(f"Loaded (best val loss: {ckpt.get('best_val_loss', 'N/A'):.6f})")
 
-    # ESM-2 (可选)
-    esm2_model = None
-    tokenizer = None
-    use_esm2 = args.use_esm2
-    if use_esm2:
-        try:
-            import esm
-            log.info(f"Loading ESM-2 ({args.esm2_model})...")
-            esm2_model, alphabet = esm.pretrained.load_model_and_alphabet(args.esm2_model)
-            esm2_model = esm2_model.to(device).eval()
-            tokenizer = alphabet.get_batch_converter()
-            log.info("ESM-2 loaded")
-        except ImportError:
-            log.warning("fair-esm not installed, falling back to AA properties")
-            use_esm2 = False
-
     # ── 单样本 ──
     if args.smiles and args.sequence:
-        if use_esm2 and esm2_model:
-            embed = compute_esm2_embedding(args.sequence, esm2_model, tokenizer, device)
-        else:
-            embed = sequence_to_aa_props(args.sequence)
-            if not use_esm2:
-                log.info("使用 AA 物化性质编码 (6-dim)，如需更高精度请加 --use-esm2")
+        # 计算 ESM-2 token 级嵌入
+        seq = args.sequence
+        tokens_batch = tokenizer([seq], return_tensors="pt")
+        tokens_batch = {k: v.to(device) for k, v in tokens_batch.items()}
+        with torch.no_grad():
+            result = esm_model(**tokens_batch, output_hidden_states=True)
+        # (1, L', 1280) 排除 [CLS]/[EOS]
+        protein_tokens = result["hidden_states"][-1][0, 1:-1, :]  # (L, 1280)
+        L = protein_tokens.shape[0]
+        protein_mask = torch.ones(L, dtype=torch.bool)
 
-        result = predict_single(model, args.smiles, embed, args.cofactor, device,
+        result = predict_single(model, args.smiles, protein_tokens, protein_mask,
+                                args.cofactor, device,
                                 measurement_type=args.measurement_type,
                                 temperature_K=args.temperature)
         print(f"\n底物: {args.smiles}")
-        print(f"蛋白: {args.sequence[:50]}{'...' if len(args.sequence) > 50 else ''}")
+        print(f"蛋白: {seq[:50]}{'...' if len(seq) > 50 else ''}")
         print(f"辅因子: {args.cofactor or '(无)'}")
         print(f"温度: {args.temperature:.1f}K")
         print(f"测量类型: {['Kd','Ki','IC50','none'][args.measurement_type]}")
@@ -281,11 +284,17 @@ def main():
         results = []
         for i, row in df.iterrows():
             try:
-                if use_esm2 and esm2_model:
-                    embed = compute_esm2_embedding(row["sequence"], esm2_model, tokenizer, device)
-                else:
-                    embed = sequence_to_aa_props(row["sequence"])
-                r = predict_single(model, row["smiles"], embed, str(row.get("cofactor", "")), device)
+                seq = row["sequence"]
+                tokens_batch = tokenizer([seq], return_tensors="pt")
+                tokens_batch = {k: v.to(device) for k, v in tokens_batch.items()}
+                with torch.no_grad():
+                    result = esm_model(**tokens_batch, output_hidden_states=True)
+                protein_tokens = result["hidden_states"][-1][0, 1:-1, :]  # (L, 1280)
+                L = protein_tokens.shape[0]
+                protein_mask = torch.ones(L, dtype=torch.bool)
+
+                r = predict_single(model, row["smiles"], protein_tokens, protein_mask,
+                                   str(row.get("cofactor", "")), device)
                 results.append({**r, "smiles": row["smiles"]})
                 if (i+1) % 100 == 0:
                     log.info(f"  {i+1}/{len(df)} done")

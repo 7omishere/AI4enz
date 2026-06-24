@@ -13,11 +13,24 @@ venv/
 .env
 .env.*
 
+# 本地私有配置（隐私/密钥）
+.claude/
+.pantheon/
+.notebook_contexts.json
+suggestion.txt
+
+# 第三方代码（非本项目文件）
+Fountain/
+2603.12845v2.pdf
+
 # Large data — 另行下载/生成
 dataset_building/data/
 dataset_building/processed/
 dataset_building/external_data/
 dataset_building/release/
+
+# 数据处理脚本（合作者自行处理数据）
+dataset_building/scripts/
 
 # Checkpoints & model weights
 *.ckpt
@@ -29,7 +42,6 @@ jetstream_storage/
 
 # 生成的分析图片
 dataset_building/analysis/
-dataset_building/checkpoints/*.png
 dataset_building/checkpoints/*.png
 
 # 缓存文件
@@ -44,9 +56,12 @@ dataset_building/models_v1_obsolete/
 *.tar.gz
 tmp/
 
+# 训练产物
+model/checkpoints/
+model/logs/
+
 # Shell scripts 运行产物
 *.sh
-!dataset_building/scripts/*.sh
 !scripts/**/*.sh
 
 # Gold data 软链接/二进制
@@ -66,3 +81,4 @@ dataset_building/KEGG/
 # Old model archives with checkpoints (>25MB)
 dataset_building/models_v1_obsolete/checkpoints/
 dataset_building/models_v1_obsolete/*.ckpt
+dataset_building/pipeline/
