@@ -1,11 +1,4 @@
-# AI4enz — 项目约定（面向 AI 助手）
-
-1.每次对话前都叫我，多米
-2.不要不懂装懂，我允许你不懂和否决/质疑我
-3.架构设计决策记录见 [learning.md](learning.md)，包含 cross-attention 方案选型、ResidueQueryAttention 动机、损失函数审核、多任务 vs 单任务文献调研等，后继所有这种对架构设计工作的修改和决策，在learning.md里面更新而不是在这里.
-4.claude.md更新不需要涉及测试的命令，需要修改的话你应该在README.md中更改（claude主要承担你对项目理解的任务）
-5.给你布置训练任务时候，以README.md为参考
-
+# AI4enz — 项目
 
 ## 项目概述
 
